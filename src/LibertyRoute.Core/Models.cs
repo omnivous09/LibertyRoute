@@ -34,7 +34,8 @@ public sealed record AdapterState(
 public sealed record NetworkStateSnapshot(
     DateTimeOffset CapturedAtUtc,
     string MachineName,
-    IReadOnlyList<AdapterState> Adapters);
+    IReadOnlyList<AdapterState> Adapters,
+    IReadOnlyList<RouteState>? Routes = null);
 
 public sealed record OwnedNetworkChange(
     Guid ChangeId,

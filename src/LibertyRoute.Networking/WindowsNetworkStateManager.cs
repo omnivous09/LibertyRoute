@@ -1,5 +1,6 @@
 using System.Net.NetworkInformation;
 using LibertyRoute.Core;
+using LibertyRoute.Networking.Native;
 
 namespace LibertyRoute.Networking;
 
@@ -37,7 +38,8 @@ public sealed class WindowsNetworkStateManager : INetworkStateManager
         return Task.FromResult(new NetworkStateSnapshot(
             DateTimeOffset.UtcNow,
             Environment.MachineName,
-            adapters));
+            adapters,
+            WindowsRouteTableReader.Capture()));
     }
 
     public async Task VerifyRestorationAsync(NetworkStateSnapshot original, CancellationToken cancellationToken)
