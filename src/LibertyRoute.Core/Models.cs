@@ -13,11 +13,27 @@ public enum ConnectionState
     RestorationFailed
 }
 
+public enum DnsConfigurationSource
+{
+    Unknown,
+    Automatic,
+    Static,
+    Mixed
+}
+
 public sealed record DnsInterfaceState(
     string InterfaceId,
     string InterfaceName,
     bool IsUp,
-    IReadOnlyList<string> DnsServers);
+    IReadOnlyList<string> DnsServers,
+    IReadOnlyList<string>? IPv4DnsServers = null,
+    IReadOnlyList<string>? IPv6DnsServers = null,
+    DnsConfigurationSource IPv4ConfigurationSource = DnsConfigurationSource.Unknown,
+    DnsConfigurationSource IPv6ConfigurationSource = DnsConfigurationSource.Unknown,
+    IReadOnlyList<string>? IPv4StaticDnsServers = null,
+    IReadOnlyList<string>? IPv4DhcpDnsServers = null,
+    IReadOnlyList<string>? IPv6StaticDnsServers = null,
+    IReadOnlyList<string>? IPv6DhcpDnsServers = null);
 
 public sealed record GatewayState(string InterfaceId, string Address);
 
@@ -35,7 +51,8 @@ public sealed record NetworkStateSnapshot(
     DateTimeOffset CapturedAtUtc,
     string MachineName,
     IReadOnlyList<AdapterState> Adapters,
-    IReadOnlyList<RouteState>? Routes = null);
+    IReadOnlyList<RouteState>? Routes = null,
+    IReadOnlyList<DnsInterfaceState>? DnsInterfaces = null);
 
 public sealed record OwnedNetworkChange(
     Guid ChangeId,

@@ -1,5 +1,6 @@
 using System.Net.NetworkInformation;
 using LibertyRoute.Core;
+using LibertyRoute.Networking.Dns;
 using LibertyRoute.Networking.Native;
 
 namespace LibertyRoute.Networking;
@@ -14,6 +15,7 @@ public sealed class WindowsNetworkStateManager : INetworkStateManager
     {
         cancellationToken.ThrowIfCancellationRequested();
 
+        var dnsInterfaces = new List<DnsInterfaceState>();
         var adapters = NetworkInterface.GetAllNetworkInterfaces()
             .Select(ni =>
             {
@@ -21,6 +23,7 @@ public sealed class WindowsNetworkStateManager : INetworkStateManager
                 var unicast = props.UnicastAddresses.Select(x => x.Address.ToString()).OrderBy(x => x).ToArray();
                 var gateways = props.GatewayAddresses.Select(x => x.Address.ToString()).OrderBy(x => x).ToArray();
                 var dns = props.DnsAddresses.Select(x => x.ToString()).OrderBy(x => x).ToArray();
+                dnsInterfaces.Add(WindowsDnsStateReader.Capture(ni, props));
 
                 return new AdapterState(
                     ni.Id,
@@ -39,7 +42,8 @@ public sealed class WindowsNetworkStateManager : INetworkStateManager
             DateTimeOffset.UtcNow,
             Environment.MachineName,
             adapters,
-            WindowsRouteTableReader.Capture()));
+            WindowsRouteTableReader.Capture(),
+            dnsInterfaces.OrderBy(x => x.InterfaceId, StringComparer.OrdinalIgnoreCase).ToArray()));
     }
 
     public async Task VerifyRestorationAsync(NetworkStateSnapshot original, CancellationToken cancellationToken)
