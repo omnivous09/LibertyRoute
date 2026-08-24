@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
@@ -26,6 +27,7 @@ public sealed class LibertyRouteWorker : BackgroundService
     {
         while (!stoppingToken.IsCancellationRequested)
         {
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: waiting for pipe client");
             await using var pipe = new NamedPipeServerStream(
                 PipeName,
                 PipeDirection.InOut,
@@ -36,14 +38,18 @@ public sealed class LibertyRouteWorker : BackgroundService
             try
             {
                 await pipe.WaitForConnectionAsync(stoppingToken);
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: client connected");
                 await HandleClientAsync(pipe, stoppingToken);
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: client request handling completed, returning to WaitForConnectionAsync");
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: shutdown cancellation requested");
                 break;
             }
             catch (Exception ex)
             {
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: pipe handling exception {ex.GetType().FullName}: {ex.Message}");
                 _logger.LogError(ex, "Named-pipe client handling failed; continuing to accept clients.");
             }
             finally
@@ -70,19 +76,28 @@ public sealed class LibertyRouteWorker : BackgroundService
 
     private async Task HandleClientAsync(Stream stream, CancellationToken cancellationToken)
     {
-        using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
-        using var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: HandleClientAsync entered");
 
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: creating StreamReader");
+        using var reader = new StreamReader(stream, new UTF8Encoding(false), leaveOpen: true);
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: StreamReader created");
+
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: ReadLineAsync starting");
         var request = await reader.ReadLineAsync(cancellationToken);
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: ReadLineAsync completed requestWasNull={request is null}");
         if (string.IsNullOrWhiteSpace(request))
             return;
+
+        var normalizedRequest = request.Trim().ToUpperInvariant();
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: command received '{normalizedRequest}'");
 
         object response;
         try
         {
-            response = request.Trim().ToUpperInvariant() switch
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: handling command '{normalizedRequest}'");
+            response = normalizedRequest switch
             {
-                "STATUS" => new { ok = true, state = _controller.State.ToString() },
+                "STATUS" => HandleStatusCommand(),
                 "SNAPSHOT" => await CaptureSnapshotAsync(cancellationToken),
                 "CONNECT" => await BeginConnectAsync(cancellationToken),
                 "DISCONNECT" => await DisconnectAsync(cancellationToken),
@@ -91,15 +106,38 @@ public sealed class LibertyRouteWorker : BackgroundService
         }
         catch (Exception ex)
         {
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: command exception {ex.GetType().FullName}: {ex.Message}");
             response = new { ok = false, error = ex.Message, state = _controller.State.ToString() };
         }
 
-        await writer.WriteLineAsync(JsonSerializer.Serialize(response));
+        var responseJson = JsonSerializer.Serialize(response);
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: starting JSON serialization (length={responseJson.Length})");
+        var serialized = JsonSerializer.Serialize(response);
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: serialization completed (length={serialized.Length})");
+
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: creating StreamWriter");
+        using var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true);
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: StreamWriter created");
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: before WriteLineAsync(responseLength={serialized.Length})");
+        await writer.WriteLineAsync(serialized);
+        await writer.FlushAsync();
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: after WriteLineAsync(responseLength={serialized.Length})");
+    }
+
+    private object HandleStatusCommand()
+    {
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: STATUS handling start");
+        var result = new { ok = true, state = _controller.State.ToString() };
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: STATUS handling end");
+        return result;
     }
 
     private async Task<object> CaptureSnapshotAsync(CancellationToken cancellationToken)
     {
+        var stopwatch = Stopwatch.StartNew();
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: starting CaptureSnapshotAsync");
         var snapshot = await _controller.CaptureDiagnosticSnapshotAsync(cancellationToken);
+        Console.Error.WriteLine($"[{DateTime.UtcNow:O}] LibertyRouteWorker: CaptureSnapshotAsync completed in {stopwatch.ElapsedMilliseconds}ms");
         return new { ok = true, snapshot };
     }
 

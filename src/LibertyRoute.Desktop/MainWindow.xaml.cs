@@ -18,7 +18,12 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        Loaded += async (_, _) => await RefreshStatusAsync();
+        Loaded += async (_, _) =>
+        {
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: Loaded event fired");
+            await RefreshStatusAsync();
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: Loaded/RefreshStatusAsync completed");
+        };
     }
 
     private async void ConnectButton_Click(object sender, RoutedEventArgs e)
@@ -60,9 +65,13 @@ public partial class MainWindow : Window
         var phase = "starting export";
         var directory = string.Empty;
         var path = string.Empty;
+
         try
         {
             phase = "connecting to service / requesting SNAPSHOT";
+            StateText.Text = "Requesting network snapshot...";
+            DetailText.Text = "Requesting network snapshot...";
+
             var response = await SendCommandAsync("SNAPSHOT");
 
             phase = "parsing response";
@@ -85,6 +94,7 @@ public partial class MainWindow : Window
             phase = "writing JSON file";
             await File.WriteAllTextAsync(path, JsonSerializer.Serialize(snapshot, SnapshotJsonOptions));
             DetailText.Text = $"Snapshot exported to {path}";
+            StateText.Text = _transactionActive ? "Recovery snapshot active" : "Disconnected";
         }
         catch (Exception ex)
         {
@@ -94,6 +104,8 @@ public partial class MainWindow : Window
                 $"Final path: {(string.IsNullOrEmpty(path) ? "(not resolved)" : path)}\n\n" +
                 $"Full exception:\n{ex}";
             MessageBox.Show(details, "LibertyRoute", MessageBoxButton.OK, MessageBoxImage.Error);
+            StateText.Text = _transactionActive ? "Recovery snapshot active" : "Disconnected";
+            DetailText.Text = "Snapshot export failed.";
         }
         finally
         {
@@ -105,14 +117,17 @@ public partial class MainWindow : Window
     {
         try
         {
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: sending STATUS");
             var response = await SendCommandAsync("STATUS");
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: STATUS response received ({response.Length} chars)");
             _transactionActive = response.Contains("SnapshotCommitted", StringComparison.OrdinalIgnoreCase);
             StateText.Text = _transactionActive ? "Recovery snapshot active" : "Disconnected";
             ConnectButton.Content = _transactionActive ? "ROLL BACK" : "CONNECT";
             DetailText.Text = response;
         }
-        catch
+        catch (Exception ex)
         {
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: STATUS failed with {ex.GetType().FullName}: {ex.Message}");
             StateText.Text = "Service unavailable";
             DetailText.Text = "Install/start the LibertyRoute Network Service.";
         }
@@ -120,13 +135,79 @@ public partial class MainWindow : Window
 
     private static async Task<string> SendCommandAsync(string command)
     {
-        await using var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-        await pipe.ConnectAsync(timeout.Token);
+        const int connectTimeoutSeconds = 1;
+        const int responseTimeoutSeconds = 8;
 
-        using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
-        using var writer = new StreamWriter(pipe, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
-        await writer.WriteLineAsync(command);
-        return await reader.ReadLineAsync(timeout.Token) ?? "{}";
+        NamedPipeClientStream? pipe = null;
+
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: attempting named-pipe connect (attempt {attempt + 1})");
+                pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+                using var connectTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(connectTimeoutSeconds));
+                await pipe.ConnectAsync(connectTimeout.Token);
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: pipe connection succeeded");
+                break;
+            }
+            catch (OperationCanceledException) when (attempt < 2)
+            {
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: connect timed out on attempt {attempt + 1}");
+                pipe?.Dispose();
+                pipe = null;
+                await Task.Delay(200);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: connect exception {ex.GetType().FullName}: {ex.Message}");
+                pipe?.Dispose();
+                pipe = null;
+                throw;
+            }
+        }
+
+        if (pipe is null)
+            throw new TimeoutException("The LibertyRoute service did not respond on the named pipe.");
+
+        try
+        {
+            var utf8NoBom = new UTF8Encoding(false);
+
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: creating request StreamWriter");
+            using var writer = new StreamWriter(pipe, utf8NoBom, leaveOpen: true);
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: request StreamWriter created");
+
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: before WriteLineAsync(command='{command}')");
+            await writer.WriteLineAsync(command);
+            await writer.FlushAsync();
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: after WriteLineAsync(command='{command}')");
+
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: creating response StreamReader");
+            using var reader = new StreamReader(pipe, utf8NoBom, leaveOpen: true);
+            Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: response StreamReader created");
+
+            using var responseTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(responseTimeoutSeconds));
+            try
+            {
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: before ReadLineAsync(command='{command}')");
+                var response = await reader.ReadLineAsync(responseTimeout.Token);
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: after ReadLineAsync(command='{command}') responseWasNull={response is null}");
+                if (response is null)
+                    throw new TimeoutException("The LibertyRoute service connected but did not return a response in time.");
+
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: response received ({response.Length} chars)");
+                return response;
+            }
+            catch (OperationCanceledException ex)
+            {
+                Console.Error.WriteLine($"[{DateTime.UtcNow:O}] MainWindow: response read timed out: {ex.GetType().FullName}: {ex.Message}");
+                throw new TimeoutException("The LibertyRoute service connected but did not return a response in time.");
+            }
+        }
+        finally
+        {
+            pipe.Dispose();
+        }
     }
 }
