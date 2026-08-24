@@ -57,9 +57,15 @@ public partial class MainWindow : Window
     private async void DiagnosticsButton_Click(object sender, RoutedEventArgs e)
     {
         DiagnosticsButton.IsEnabled = false;
+        var phase = "starting export";
+        var directory = string.Empty;
+        var path = string.Empty;
         try
         {
+            phase = "connecting to service / requesting SNAPSHOT";
             var response = await SendCommandAsync("SNAPSHOT");
+
+            phase = "parsing response";
             using var document = JsonDocument.Parse(response);
             if (!document.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
                 throw new InvalidOperationException(document.RootElement.GetProperty("error").GetString());
@@ -69,15 +75,25 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException("The service returned an empty network snapshot.");
 
             var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss");
-            var directory = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            phase = "resolving Documents path";
+            directory = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+
+            phase = "creating export directory";
             Directory.CreateDirectory(directory);
-            var path = Path.Combine(directory, $"LibertyRoute-NetworkSnapshot-{timestamp}.json");
+
+            path = Path.Combine(directory, $"LibertyRoute-NetworkSnapshot-{timestamp}.json");
+            phase = "writing JSON file";
             await File.WriteAllTextAsync(path, JsonSerializer.Serialize(snapshot, SnapshotJsonOptions));
             DetailText.Text = $"Snapshot exported to {path}";
         }
         catch (Exception ex)
         {
-            MessageBox.Show(ex.Message, "LibertyRoute", MessageBoxButton.OK, MessageBoxImage.Error);
+            var details = $"Phase: {phase}\n" +
+                $"Exception type: {ex.GetType().FullName}\n" +
+                $"Message: {ex.Message}\n" +
+                $"Final path: {(string.IsNullOrEmpty(path) ? "(not resolved)" : path)}\n\n" +
+                $"Full exception:\n{ex}";
+            MessageBox.Show(details, "LibertyRoute", MessageBoxButton.OK, MessageBoxImage.Error);
         }
         finally
         {
