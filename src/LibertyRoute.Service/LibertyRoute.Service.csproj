@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <OutputType>Exe</OutputType>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LibertyRoute.Core\LibertyRoute.Core.csproj" />
+    <ProjectReference Include="..\LibertyRoute.Networking\LibertyRoute.Networking.csproj" />
+    <ProjectReference Include="..\LibertyRoute.Recovery\LibertyRoute.Recovery.csproj" />
+    <ProjectReference Include="..\LibertyRoute.Engine\LibertyRoute.Engine.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.0" />
+  </ItemGroup>
+</Project>
