@@ -35,7 +35,16 @@ jobs:
           --configuration Release
           --runtime win-x64
           --self-contained false
-          --output publish
+          --output publish/Desktop
+
+      - name: Publish service app
+        run: >
+          dotnet publish
+          src/LibertyRoute.Service/LibertyRoute.Service.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained false
+          --output publish/Service
 
       - name: Upload LibertyRoute build
         uses: actions/upload-artifact@v4
