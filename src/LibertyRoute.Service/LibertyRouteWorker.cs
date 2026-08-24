@@ -33,8 +33,24 @@ public sealed class LibertyRouteWorker : BackgroundService
                 PipeTransmissionMode.Byte,
                 PipeOptions.Asynchronous);
 
-            await pipe.WaitForConnectionAsync(stoppingToken);
-            await HandleClientAsync(pipe, stoppingToken);
+            try
+            {
+                await pipe.WaitForConnectionAsync(stoppingToken);
+                await HandleClientAsync(pipe, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Named-pipe client handling failed; continuing to accept clients.");
+            }
+            finally
+            {
+                if (pipe.IsConnected)
+                    pipe.Disconnect();
+            }
         }
     }
 
