@@ -25,6 +25,19 @@ public sealed class ConnectionController
 
     public ConnectionState State => _active?.State ?? ConnectionState.Disconnected;
 
+    public async Task<NetworkStateSnapshot> CaptureDiagnosticSnapshotAsync(CancellationToken cancellationToken)
+    {
+        await _networkLock.WaitAsync(cancellationToken);
+        try
+        {
+            return await _network.CaptureStateAsync(cancellationToken);
+        }
+        finally
+        {
+            _networkLock.Release();
+        }
+    }
+
     public async Task<NetworkTransaction> BeginSafeConnectAsync(CancellationToken cancellationToken)
     {
         await _networkLock.WaitAsync(cancellationToken);

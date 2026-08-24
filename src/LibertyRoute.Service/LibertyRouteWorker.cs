@@ -67,6 +67,7 @@ public sealed class LibertyRouteWorker : BackgroundService
             response = request.Trim().ToUpperInvariant() switch
             {
                 "STATUS" => new { ok = true, state = _controller.State.ToString() },
+                "SNAPSHOT" => await CaptureSnapshotAsync(cancellationToken),
                 "CONNECT" => await BeginConnectAsync(cancellationToken),
                 "DISCONNECT" => await DisconnectAsync(cancellationToken),
                 _ => new { ok = false, error = "Unknown command." }
@@ -78,6 +79,12 @@ public sealed class LibertyRouteWorker : BackgroundService
         }
 
         await writer.WriteLineAsync(JsonSerializer.Serialize(response));
+    }
+
+    private async Task<object> CaptureSnapshotAsync(CancellationToken cancellationToken)
+    {
+        var snapshot = await _controller.CaptureDiagnosticSnapshotAsync(cancellationToken);
+        return new { ok = true, snapshot };
     }
 
     private async Task<object> BeginConnectAsync(CancellationToken cancellationToken)

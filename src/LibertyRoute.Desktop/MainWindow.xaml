@@ -21,6 +21,8 @@
                        HorizontalAlignment="Center" Margin="0,12,0,28"/>
             <Button x:Name="ConnectButton" Content="CONNECT" Width="210" Height="54"
                     FontSize="16" FontWeight="SemiBold" Click="ConnectButton_Click"/>
+                <Button x:Name="DiagnosticsButton" Content="Export Network Snapshot" Width="210" Height="38"
+                    Margin="0,12,0,0" Click="DiagnosticsButton_Click"/>
             <TextBlock x:Name="DetailText" Text="Server: Not configured" Margin="0,22,0,0"
                        TextAlignment="Center" TextWrapping="Wrap" Opacity="0.75"/>
         </StackPanel>

@@ -9,6 +9,10 @@ namespace LibertyRoute.Desktop;
 public partial class MainWindow : Window
 {
     private const string PipeName = "LibertyRoute.Network.v1";
+    private static readonly JsonSerializerOptions SnapshotJsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        WriteIndented = true
+    };
     private bool _transactionActive;
 
     public MainWindow()
@@ -47,6 +51,37 @@ public partial class MainWindow : Window
         finally
         {
             ConnectButton.IsEnabled = true;
+        }
+    }
+
+    private async void DiagnosticsButton_Click(object sender, RoutedEventArgs e)
+    {
+        DiagnosticsButton.IsEnabled = false;
+        try
+        {
+            var response = await SendCommandAsync("SNAPSHOT");
+            using var document = JsonDocument.Parse(response);
+            if (!document.RootElement.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
+                throw new InvalidOperationException(document.RootElement.GetProperty("error").GetString());
+
+            var snapshot = document.RootElement.GetProperty("snapshot").Deserialize<object>(SnapshotJsonOptions);
+            if (snapshot is null)
+                throw new InvalidOperationException("The service returned an empty network snapshot.");
+
+            var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss");
+            var directory = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(directory, $"LibertyRoute-NetworkSnapshot-{timestamp}.json");
+            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(snapshot, SnapshotJsonOptions));
+            DetailText.Text = $"Snapshot exported to {path}";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "LibertyRoute", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            DiagnosticsButton.IsEnabled = true;
         }
     }
 
