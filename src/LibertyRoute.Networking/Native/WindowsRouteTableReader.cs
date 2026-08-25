@@ -65,6 +65,7 @@ internal static class WindowsRouteTableReader
     private struct MibIpForwardTable2
     {
         public uint NumEntries;
+        private uint TableAlignmentPadding;
     }
 
     [StructLayout(LayoutKind.Sequential)]
