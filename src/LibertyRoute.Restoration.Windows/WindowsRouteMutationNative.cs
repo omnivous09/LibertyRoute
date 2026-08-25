@@ -313,6 +313,10 @@ internal sealed class WindowsRouteMutationNative : IRouteMutationNative
 
 internal sealed class WindowsRouteNativeApi : IWindowsRouteNativeApi
 {
+    internal WindowsRouteNativeApi()
+    {
+    }
+
     public void InitializeIpForwardEntry(ref NativeMibIpForwardRow2 row)
         => NativeMethods.InitializeIpForwardEntry(ref row);
 
