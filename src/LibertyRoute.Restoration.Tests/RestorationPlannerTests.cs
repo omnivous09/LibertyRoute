@@ -323,6 +323,139 @@ public sealed class RestorationPlannerTests
         Assert.True(first.Summary.BlockingReasons.SequenceEqual(second.Summary.BlockingReasons));
     }
 
+    [Fact]
+    public void NoOwnershipEvidenceDeniesOperation()
+    {
+        var operation = MissingAddressOperation();
+
+        var decision = RestorationAuthorizationPolicy.Authorize(operation, Array.Empty<OwnershipEvidence>(), SessionId);
+
+        Assert.Equal(OperationAuthorizationStatus.DeniedNoOwnership, decision.Status);
+    }
+
+    [Fact]
+    public void ExactOwnershipEvidenceAuthorizesBaselineRestoration()
+    {
+        var operation = MissingAddressOperation();
+        var evidence = Evidence(operation, original: operation.OriginalValue, applied: operation.CurrentValue);
+
+        var decision = RestorationAuthorizationPolicy.Authorize(operation, new[] { evidence }, SessionId);
+
+        Assert.Equal(OperationAuthorizationStatus.Authorized, decision.Status);
+        Assert.Equal(evidence, decision.MatchedEvidence);
+        Assert.True(decision.FutureAutomaticExecutionAllowed);
+    }
+
+    [Theory]
+    [InlineData("session")]
+    [InlineData("target")]
+    [InlineData("applied")]
+    public void OwnershipMismatchDeniesOperation(string mismatch)
+    {
+        var operation = MissingAddressOperation();
+        var evidence = Evidence(operation,
+            sessionId: mismatch == "session" ? Guid.NewGuid() : SessionId,
+            target: mismatch == "target" ? "other" : operation.TargetIdentity,
+            applied: mismatch == "applied" ? "different" : operation.CurrentValue);
+
+        var decision = RestorationAuthorizationPolicy.Authorize(operation, new[] { evidence }, SessionId);
+
+        Assert.Equal(mismatch is "session" or "target" ? OperationAuthorizationStatus.DeniedNoOwnership : OperationAuthorizationStatus.DeniedOwnershipMismatch, decision.Status);
+    }
+
+    [Fact]
+    public void IncompleteEvidenceDeniesOperation()
+    {
+        var operation = MissingAddressOperation();
+        var decision = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation, complete: false) }, SessionId);
+
+        Assert.Equal(OperationAuthorizationStatus.DeniedOwnershipMismatch, decision.Status);
+    }
+
+    [Fact]
+    public void OwnedAddedRouteCanAuthorizeFutureRemoval()
+    {
+        var operation = AddedOperation(DryRunOperationCategory.Route, "route-1", "route-value");
+        var evidence = Evidence(operation, original: "<absent>", applied: operation.CurrentValue);
+
+        var decision = RestorationAuthorizationPolicy.Authorize(operation, new[] { evidence }, SessionId);
+
+        Assert.Equal(OperationAuthorizationStatus.Authorized, decision.Status);
+        Assert.Contains("future removal", decision.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void MissingBaselineRouteRequiresExactProof()
+    {
+        var operation = new DryRunRestorationOperation(DryRunOperationCategory.Route, DryRunAction.RestoreBaseline, "route-1", "baseline", "<absent>", "test", 1, true, false, DryRunSafetyState.SafeToPlan);
+        var denied = RestorationAuthorizationPolicy.Authorize(operation, Array.Empty<OwnershipEvidence>(), SessionId);
+        var authorized = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation) }, SessionId);
+
+        Assert.Equal(OperationAuthorizationStatus.DeniedNoOwnership, denied.Status);
+        Assert.Equal(OperationAuthorizationStatus.Authorized, authorized.Status);
+    }
+
+    [Fact]
+    public void OwnedDnsAndAddressChangesAuthorizeRestoration()
+    {
+        foreach (var category in new[] { DryRunOperationCategory.Dns, DryRunOperationCategory.Address })
+        {
+            var operation = AddedOperation(category, category.ToString(), "current");
+            operation = operation with { Action = DryRunAction.RestoreBaseline, OriginalValue = "original" };
+            var decision = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation) }, SessionId);
+
+            Assert.Equal(OperationAuthorizationStatus.Authorized, decision.Status);
+        }
+    }
+
+    [Fact]
+    public void UnsupportedAndUnverifiableOperationsAreDenied()
+    {
+        foreach (var state in new[] { DryRunSafetyState.Unsupported, DryRunSafetyState.Unverifiable })
+        {
+            var operation = MissingAddressOperation() with { SafetyState = state };
+            var decision = RestorationAuthorizationPolicy.Authorize(operation, Array.Empty<OwnershipEvidence>(), SessionId);
+
+            Assert.Equal(state == DryRunSafetyState.Unsupported ? OperationAuthorizationStatus.DeniedUnsupported : OperationAuthorizationStatus.DeniedUnverifiable, decision.Status);
+        }
+    }
+
+    [Fact]
+    public void BatchAuthorizationIsOrderedAndConservative()
+    {
+        var route = MissingAddressOperation() with { Category = DryRunOperationCategory.Route, ExecutionOrder = 2 };
+        var address = MissingAddressOperation() with { ExecutionOrder = 1 };
+        var result = new DryRunRestorationResult(new[] { route, address }, new DryRunRestorationSummary(2, 2, 2, 0, 0, false, Array.Empty<string>()));
+
+        var batch = RestorationAuthorizationPolicy.AuthorizeBatch(result, new[] { Evidence(address) }, SessionId);
+
+        Assert.Equal(new[] { 1, 2 }, batch.Decisions.Select(decision => decision.Operation.ExecutionOrder));
+        Assert.Single(batch.AuthorizedOperations);
+        Assert.Single(batch.DeniedOperations);
+        Assert.False(batch.FutureAutomaticExecutionAllowed);
+    }
+
+    [Fact]
+    public void AuthorizationDoesNotAlterInputsOrExposeMutationMethods()
+    {
+        var operation = MissingAddressOperation();
+        var evidence = Evidence(operation);
+        var before = evidence with { };
+
+        _ = RestorationAuthorizationPolicy.Authorize(operation, new[] { evidence }, SessionId);
+
+        Assert.Equal(before, evidence);
+        Assert.DoesNotContain(typeof(RestorationAuthorizationPolicy).GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static), method => method.Name.Contains("Apply", StringComparison.OrdinalIgnoreCase) || method.Name.Contains("Execute", StringComparison.OrdinalIgnoreCase) || method.Name.Contains("Commit", StringComparison.OrdinalIgnoreCase) || method.Name.Contains("Mutate", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void EvidenceModelContainsNoSecretFields()
+    {
+        var names = typeof(OwnershipEvidence).GetProperties().Select(property => property.Name).ToArray();
+
+        Assert.DoesNotContain(names, name => name.Contains("password", StringComparison.OrdinalIgnoreCase) || name.Contains("token", StringComparison.OrdinalIgnoreCase) || name.Contains("private", StringComparison.OrdinalIgnoreCase) || name.Contains("credential", StringComparison.OrdinalIgnoreCase) || name.Contains("certificate", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static RestorationDifference Single(NetworkStateSnapshot original, NetworkStateSnapshot current, RestorationCategory category)
         => Assert.Single(RestorationPlanner.CreatePlan(original, current).Differences, difference => difference.Category == category);
 
@@ -331,6 +464,24 @@ public sealed class RestorationPlannerTests
 
     private static DryRunRestorationOperation SingleOperation(DryRunRestorationResult result, DryRunOperationCategory category)
         => Assert.Single(result.Operations, operation => operation.Category == category);
+
+    private static readonly Guid SessionId = Guid.Parse("11111111-1111-1111-1111-111111111111");
+
+    private static DryRunRestorationOperation MissingAddressOperation()
+        => AddedOperation(DryRunOperationCategory.Address, "adapter-a", "<absent>") with
+        {
+            Action = DryRunAction.RestoreBaseline,
+            OriginalValue = "192.0.2.1",
+            CurrentValue = "<absent>",
+            SafetyState = DryRunSafetyState.SafeToPlan,
+            ExecutionOrder = 1
+        };
+
+    private static DryRunRestorationOperation AddedOperation(DryRunOperationCategory category, string target, string current)
+        => new(category, DryRunAction.ManualReview, target, "<absent>", current, "test", 1, true, false, DryRunSafetyState.ManualReview);
+
+    private static OwnershipEvidence Evidence(DryRunRestorationOperation operation, Guid? sessionId = null, string? target = null, string? original = null, string? applied = null, bool complete = true)
+        => new(sessionId ?? SessionId, operation.Category, target ?? operation.TargetIdentity, original ?? operation.OriginalValue, applied ?? operation.CurrentValue, Guid.Parse("22222222-2222-2222-2222-222222222222"), DateTimeOffset.UnixEpoch, 1, OwnershipEvidenceSource.TestFixture, complete);
 
     private static NetworkStateSnapshot Snapshot(AdapterState? adapter = null, IReadOnlyList<RouteState>? routes = null)
         => new(DateTimeOffset.UnixEpoch, "test", adapter is null ? Array.Empty<AdapterState>() : new[] { adapter }, routes, null);
