@@ -373,6 +373,35 @@ public sealed class RestorationPlannerTests
     }
 
     [Fact]
+    public void WrongSessionEvidenceDoesNotAuthorizeWhenActiveSessionEvidenceMismatches()
+    {
+        var operation = MissingAddressOperation();
+        var activeMismatch = Evidence(operation, sessionId: SessionId, original: operation.OriginalValue, applied: "different-applied");
+        var wrongSessionPerfectMatch = Evidence(operation, sessionId: Guid.NewGuid(), original: operation.OriginalValue, applied: operation.CurrentValue);
+
+        var decision = RestorationAuthorizationPolicy.Authorize(operation, new[] { activeMismatch, wrongSessionPerfectMatch }, SessionId);
+
+        Assert.Equal(OperationAuthorizationStatus.DeniedOwnershipMismatch, decision.Status);
+        Assert.NotNull(decision.MatchedEvidence);
+        Assert.Equal(SessionId, decision.MatchedEvidence!.SessionId);
+        Assert.NotEqual(wrongSessionPerfectMatch, decision.MatchedEvidence);
+        Assert.False(decision.Status == OperationAuthorizationStatus.Authorized);
+    }
+
+    [Fact]
+    public void OnlyWrongSessionPerfectEvidenceIsDenied()
+    {
+        var operation = MissingAddressOperation();
+        var wrongSessionPerfectMatch = Evidence(operation, sessionId: Guid.NewGuid(), original: operation.OriginalValue, applied: operation.CurrentValue);
+
+        var decision = RestorationAuthorizationPolicy.Authorize(operation, new[] { wrongSessionPerfectMatch }, SessionId);
+
+        Assert.Equal(OperationAuthorizationStatus.DeniedNoOwnership, decision.Status);
+        Assert.NotNull(decision.MatchedEvidence);
+        Assert.Equal(wrongSessionPerfectMatch, decision.MatchedEvidence);
+    }
+
+    [Fact]
     public void OwnedAddedRouteCanAuthorizeFutureRemoval()
     {
         var operation = AddedOperation(DryRunOperationCategory.Route, "route-1", "route-value");
@@ -455,6 +484,312 @@ public sealed class RestorationPlannerTests
 
         Assert.DoesNotContain(names, name => name.Contains("password", StringComparison.OrdinalIgnoreCase) || name.Contains("token", StringComparison.OrdinalIgnoreCase) || name.Contains("private", StringComparison.OrdinalIgnoreCase) || name.Contains("credential", StringComparison.OrdinalIgnoreCase) || name.Contains("certificate", StringComparison.OrdinalIgnoreCase));
     }
+
+    [Fact]
+    public void AuthorizedOperationCreatesExecutionRequest()
+    {
+        var operation = MissingAddressOperation();
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation) }, SessionId);
+
+        var created = AuthorizedRestorationRequest.Create(operation, authorization, TransactionId, SessionId);
+
+        Assert.Equal(operation.Category, created.Category);
+        Assert.Equal(operation.TargetIdentity, created.TargetIdentity);
+        Assert.Equal(operation.ExecutionOrder, created.ExecutionOrder);
+        Assert.Equal(authorization.MatchedEvidence!.SessionId, created.SessionId);
+        Assert.Equal(TransactionId, created.TransactionId);
+    }
+
+    [Fact]
+    public void DeniedAuthorizationCannotCreateRequest()
+    {
+        var operation = MissingAddressOperation();
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, Array.Empty<OwnershipEvidence>(), SessionId);
+
+        var created = AuthorizedRestorationRequest.TryCreate(operation, authorization, TransactionId, SessionId, out var request, out var reason);
+
+        Assert.False(created);
+        Assert.Null(request);
+        Assert.False(string.IsNullOrWhiteSpace(reason));
+    }
+
+    [Fact]
+    public void ManualReviewCannotCreateRequest()
+    {
+        var operation = AddedOperation(DryRunOperationCategory.Route, "route-a", "current");
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation, original: "<absent>", applied: operation.CurrentValue) }, SessionId);
+
+        var created = AuthorizedRestorationRequest.TryCreate(operation, authorization, TransactionId, SessionId, out _, out var reason);
+
+        Assert.False(created);
+        Assert.Contains("manual review", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void UnsupportedCannotCreateRequest()
+    {
+        var operation = MissingAddressOperation() with { SafetyState = DryRunSafetyState.Unsupported, Action = DryRunAction.RestoreBaseline };
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation) }, SessionId);
+
+        var created = AuthorizedRestorationRequest.TryCreate(operation, authorization, TransactionId, SessionId, out _, out var reason);
+
+        Assert.False(created);
+        Assert.Contains("unsupported", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void UnverifiableCannotCreateRequest()
+    {
+        var operation = MissingAddressOperation() with { SafetyState = DryRunSafetyState.Unverifiable };
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation) }, SessionId);
+
+        var created = AuthorizedRestorationRequest.TryCreate(operation, authorization, TransactionId, SessionId, out _, out var reason);
+
+        Assert.False(created);
+        Assert.Contains("unverifiable", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void WrongSessionCannotCreateRequest()
+    {
+        var operation = MissingAddressOperation();
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation, sessionId: Guid.NewGuid()) }, SessionId);
+
+        var created = AuthorizedRestorationRequest.TryCreate(operation, authorization, TransactionId, SessionId, out _, out var reason);
+
+        Assert.False(created);
+        Assert.Contains("session", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void AuthorizationForOperationACannotAuthorizeOperationB()
+    {
+        var operationA = MissingAddressOperation();
+        var operationB = MissingAddressOperation() with { TargetIdentity = "different-target", OriginalValue = "different" };
+        var authorization = RestorationAuthorizationPolicy.Authorize(operationA, new[] { Evidence(operationA) }, SessionId);
+
+        var created = AuthorizedRestorationRequest.TryCreate(operationB, authorization, TransactionId, SessionId, out _, out var reason);
+
+        Assert.False(created);
+        Assert.Contains("operation", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ModifiedTargetIdentityIsRejected()
+    {
+        var operation = MissingAddressOperation();
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation) }, SessionId);
+        var modified = operation with { TargetIdentity = "altered-target" };
+
+        var created = AuthorizedRestorationRequest.TryCreate(modified, authorization, TransactionId, SessionId, out _, out var reason);
+
+        Assert.False(created);
+        Assert.Contains("target", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ModifiedActionCategoryValueIsRejected()
+    {
+        var operation = MissingAddressOperation();
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation) }, SessionId);
+        var modified = operation with { Action = DryRunAction.ManualReview, OriginalValue = "tampered" };
+
+        var created = AuthorizedRestorationRequest.TryCreate(modified, authorization, TransactionId, SessionId, out _, out var reason);
+
+        Assert.False(created);
+        Assert.Contains("original", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void IncompleteRequiredValuesAreRejected()
+    {
+        var operation = MissingAddressOperation() with { TargetIdentity = string.Empty, OriginalValue = string.Empty };
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation, target: string.Empty, original: string.Empty) }, SessionId);
+
+        var created = AuthorizedRestorationRequest.TryCreate(operation, authorization, TransactionId, SessionId, out _, out var reason);
+
+        Assert.False(created);
+        Assert.Contains("required", reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void DeterministicBatchOrderingIsPreserved()
+    {
+        var first = MissingAddressOperation() with { ExecutionOrder = 2, TargetIdentity = "adapter-b" };
+        var second = MissingAddressOperation() with { ExecutionOrder = 1, TargetIdentity = "adapter-a" };
+        var batch = new DryRunRestorationResult(new[] { first, second }, new DryRunRestorationSummary(2, 2, 2, 0, 0, false, Array.Empty<string>()));
+        var auth = new[]
+        {
+            RestorationAuthorizationPolicy.Authorize(first, new[] { Evidence(first, target: first.TargetIdentity) }, SessionId),
+            RestorationAuthorizationPolicy.Authorize(second, new[] { Evidence(second, target: second.TargetIdentity) }, SessionId)
+        };
+        var combined = new BatchAuthorizationResult(auth, auth.Select(d => d.Operation).ToArray(), Array.Empty<DryRunRestorationOperation>(), Array.Empty<DryRunRestorationOperation>(), Array.Empty<string>(), true);
+
+        var preparation = RestorationExecutionPreparation.Prepare(combined, TransactionId, SessionId);
+
+        Assert.Equal(new[] { 1, 2 }, preparation.AuthorizedRequests.Select(request => request.ExecutionOrder));
+        Assert.True(preparation.CanExecuteAutomatically);
+    }
+
+    [Fact]
+    public void DuplicateSequenceIsRejected()
+    {
+        var first = MissingAddressOperation() with { ExecutionOrder = 1, TargetIdentity = "a" };
+        var second = MissingAddressOperation() with { ExecutionOrder = 1, TargetIdentity = "b" };
+        var auth = new[]
+        {
+            RestorationAuthorizationPolicy.Authorize(first, new[] { Evidence(first, target: first.TargetIdentity) }, SessionId),
+            RestorationAuthorizationPolicy.Authorize(second, new[] { Evidence(second, target: second.TargetIdentity) }, SessionId)
+        };
+        var batch = new BatchAuthorizationResult(auth, auth.Select(d => d.Operation).ToArray(), Array.Empty<DryRunRestorationOperation>(), Array.Empty<DryRunRestorationOperation>(), Array.Empty<string>(), true);
+
+        var preparation = RestorationExecutionPreparation.Prepare(batch, TransactionId, SessionId);
+
+        Assert.False(preparation.CanExecuteAutomatically);
+        Assert.Contains(preparation.BlockingReasons, reason => reason.Contains("sequence", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void DuplicateOperationIdentityIsRejected()
+    {
+        var first = MissingAddressOperation() with { ExecutionOrder = 1, TargetIdentity = "same" };
+        var second = MissingAddressOperation() with { ExecutionOrder = 2, TargetIdentity = "same" };
+        var auth = new[]
+        {
+            RestorationAuthorizationPolicy.Authorize(first, new[] { Evidence(first, target: "same") }, SessionId),
+            RestorationAuthorizationPolicy.Authorize(second, new[] { Evidence(second, target: "same") }, SessionId)
+        };
+        var batch = new BatchAuthorizationResult(auth, auth.Select(d => d.Operation).ToArray(), Array.Empty<DryRunRestorationOperation>(), Array.Empty<DryRunRestorationOperation>(), Array.Empty<string>(), true);
+
+        var preparation = RestorationExecutionPreparation.Prepare(batch, TransactionId, SessionId);
+
+        Assert.False(preparation.CanExecuteAutomatically);
+        Assert.Contains(preparation.BlockingReasons, reason => reason.Contains("identity", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void BatchWithOneDeniedOperationCanExecuteAutomaticallyFalse()
+    {
+        var authorized = MissingAddressOperation();
+        var denied = MissingAddressOperation() with { TargetIdentity = "denied", ExecutionOrder = 2 };
+        var auth = new[]
+        {
+            RestorationAuthorizationPolicy.Authorize(authorized, new[] { Evidence(authorized) }, SessionId),
+            RestorationAuthorizationPolicy.Authorize(denied, Array.Empty<OwnershipEvidence>(), SessionId)
+        };
+        var batch = new BatchAuthorizationResult(auth, new[] { authorized }, new[] { denied }, Array.Empty<DryRunRestorationOperation>(), new[] { "No ownership evidence matches the active session, category, and target." }, false);
+
+        var preparation = RestorationExecutionPreparation.Prepare(batch, TransactionId, SessionId);
+
+        Assert.False(preparation.CanExecuteAutomatically);
+        Assert.Contains(preparation.RejectedOperations, operation => operation.TargetIdentity == "denied");
+    }
+
+    [Fact]
+    public void BatchWithOneManualReviewOperationFalse()
+    {
+        var authorized = MissingAddressOperation();
+        var manual = AddedOperation(DryRunOperationCategory.Route, "route-a", "current");
+        var auth = new[]
+        {
+            RestorationAuthorizationPolicy.Authorize(authorized, new[] { Evidence(authorized) }, SessionId),
+            RestorationAuthorizationPolicy.Authorize(manual, new[] { Evidence(manual, original: "<absent>", applied: manual.CurrentValue) }, SessionId)
+        };
+        var batch = new BatchAuthorizationResult(auth, new[] { authorized }, Array.Empty<DryRunRestorationOperation>(), new[] { manual }, Array.Empty<string>(), false);
+
+        var preparation = RestorationExecutionPreparation.Prepare(batch, TransactionId, SessionId);
+
+        Assert.False(preparation.CanExecuteAutomatically);
+    }
+
+    [Fact]
+    public void AllAuthorizedBatchReturnsTrue()
+    {
+        var operation = MissingAddressOperation();
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation) }, SessionId);
+        var batch = new BatchAuthorizationResult(new[] { authorization }, new[] { operation }, Array.Empty<DryRunRestorationOperation>(), Array.Empty<DryRunRestorationOperation>(), Array.Empty<string>(), true);
+
+        var preparation = RestorationExecutionPreparation.Prepare(batch, TransactionId, SessionId);
+
+        Assert.True(preparation.CanExecuteAutomatically);
+        Assert.Single(preparation.AuthorizedRequests);
+    }
+
+    [Fact]
+    public void RepeatedPreparationProducesEquivalentOutput()
+    {
+        var operation = MissingAddressOperation();
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation) }, SessionId);
+        var batch = new BatchAuthorizationResult(new[] { authorization }, new[] { operation }, Array.Empty<DryRunRestorationOperation>(), Array.Empty<DryRunRestorationOperation>(), Array.Empty<string>(), true);
+
+        var first = RestorationExecutionPreparation.Prepare(batch, TransactionId, SessionId);
+        var second = RestorationExecutionPreparation.Prepare(batch, TransactionId, SessionId);
+
+        Assert.Equal(first.AuthorizedRequests, second.AuthorizedRequests);
+        Assert.Equal(first.BlockingReasons, second.BlockingReasons);
+        Assert.Equal(first.CanExecuteAutomatically, second.CanExecuteAutomatically);
+    }
+
+    [Fact]
+    public void InputAuthorizationResultsRemainUnchanged()
+    {
+        var operation = MissingAddressOperation();
+        var authorization = RestorationAuthorizationPolicy.Authorize(operation, new[] { Evidence(operation) }, SessionId);
+        var before = authorization with { };
+        var batch = new BatchAuthorizationResult(new[] { authorization }, new[] { operation }, Array.Empty<DryRunRestorationOperation>(), Array.Empty<DryRunRestorationOperation>(), Array.Empty<string>(), true);
+
+        _ = RestorationExecutionPreparation.Prepare(batch, TransactionId, SessionId);
+
+        Assert.Equal(before, authorization);
+    }
+
+    [Fact]
+    public void CancellationTokenIsPartOfFutureProviderContract()
+    {
+        var method = typeof(IRestorationMutationProvider).GetMethod(nameof(IRestorationMutationProvider.ApplyAsync));
+
+        Assert.NotNull(method);
+        Assert.Equal(typeof(CancellationToken), method!.GetParameters()[1].ParameterType);
+    }
+
+    [Fact]
+    public void ProviderAcceptsAuthorizedRestorationRequestOnly()
+    {
+        var method = typeof(IRestorationMutationProvider).GetMethod(nameof(IRestorationMutationProvider.ApplyAsync));
+
+        Assert.Equal(typeof(AuthorizedRestorationRequest), method!.GetParameters()[0].ParameterType);
+    }
+
+    [Fact]
+    public void NoConcreteMutationProviderImplementationExists()
+    {
+        var implementations = typeof(IRestorationMutationProvider).Assembly
+            .GetTypes()
+            .Where(type => type != typeof(IRestorationMutationProvider) && typeof(IRestorationMutationProvider).IsAssignableFrom(type))
+            .ToArray();
+
+        Assert.Empty(implementations);
+    }
+
+    [Fact]
+    public void AuthorizedRequestContainsNoSecretFields()
+    {
+        var propertyNames = typeof(AuthorizedRestorationRequest).GetProperties().Select(property => property.Name).ToArray();
+
+        Assert.DoesNotContain(propertyNames, name => name.Contains("password", StringComparison.OrdinalIgnoreCase) || name.Contains("token", StringComparison.OrdinalIgnoreCase) || name.Contains("private", StringComparison.OrdinalIgnoreCase) || name.Contains("credential", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void ExecutionBoundaryDoesNotWireProductionMutationCode()
+    {
+        var assembly = typeof(IRestorationMutationProvider).Assembly;
+        Assert.DoesNotContain(assembly.GetTypes(), type => type.Namespace is not null && type.Namespace.Contains("LibertyRoute.Service", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(assembly.GetTypes(), type => type.Namespace is not null && type.Namespace.Contains("LibertyRoute.Desktop", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(assembly.GetTypes(), type => type.Namespace is not null && type.Namespace.Contains("LibertyRoute.Networking", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(assembly.GetTypes(), type => type.Namespace is not null && type.Namespace.Contains("LibertyRoute.Recovery", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static readonly Guid TransactionId = Guid.Parse("33333333-3333-3333-3333-333333333333");
 
     private static RestorationDifference Single(NetworkStateSnapshot original, NetworkStateSnapshot current, RestorationCategory category)
         => Assert.Single(RestorationPlanner.CreatePlan(original, current).Differences, difference => difference.Category == category);

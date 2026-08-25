@@ -62,23 +62,36 @@ public static class RestorationAuthorizationPolicy
             return Decision(operation, operationIdentity, OperationAuthorizationStatus.DeniedUnverifiable, "The operation cannot be verified from the available state.", null);
 
         var candidates = ownershipEvidence
-            .Where(evidence => evidence.SessionId == activeSessionId &&
-                               evidence.Category == operation.Category &&
+            .Where(evidence => evidence.Category == operation.Category &&
                                StringComparer.Ordinal.Equals(evidence.TargetIdentity, operation.TargetIdentity))
             .OrderBy(evidence => evidence.SequenceNumber ?? int.MaxValue)
             .ThenBy(evidence => evidence.ChangeId)
             .ToArray();
 
-        if (candidates.Length == 0)
-            return Decision(operation, operationIdentity, OperationAuthorizationStatus.DeniedNoOwnership, "No ownership evidence matches the active session, category, and target.", null);
+        var sessionCandidates = candidates
+            .Where(evidence => evidence.SessionId == activeSessionId)
+            .ToArray();
+        var mismatchedSessionCandidate = candidates
+            .FirstOrDefault(evidence => evidence.SessionId != activeSessionId);
 
-        var evidence = candidates.FirstOrDefault(item => item.IsComplete &&
+        if (sessionCandidates.Length == 0)
+        {
+            return Decision(
+                operation,
+                operationIdentity,
+                OperationAuthorizationStatus.DeniedNoOwnership,
+                "No ownership evidence matches the active session, category, and target.",
+                mismatchedSessionCandidate);
+        }
+
+        var evidence = sessionCandidates.FirstOrDefault(item => item.IsComplete &&
             StringComparer.Ordinal.Equals(item.OriginalValue, ExpectedOriginal(operation)) &&
             StringComparer.Ordinal.Equals(item.AppliedValue, ExpectedApplied(operation)));
         if (evidence is null)
         {
             return Decision(operation, operationIdentity, OperationAuthorizationStatus.DeniedOwnershipMismatch,
-                "Ownership evidence exists, but session, target, original value, or LibertyRoute-applied value does not exactly match.", null);
+                "Ownership evidence exists in the active session, but target, original value, or LibertyRoute-applied value does not exactly match.",
+                sessionCandidates.FirstOrDefault());
         }
 
         if (operation.Action == DryRunAction.ManualReview)
