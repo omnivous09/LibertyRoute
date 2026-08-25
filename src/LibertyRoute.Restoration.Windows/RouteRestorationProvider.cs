@@ -201,7 +201,17 @@ public sealed record RouteRestorationCommand(
 
 }
 
-public sealed record RouteQueryResult(bool Exists, RouteState? Route)
+public enum RouteNativeStatus
+{
+    Success,
+    AccessDenied,
+    AlreadyExists,
+    NotFound,
+    InvalidParameter,
+    Failed
+}
+
+public sealed record RouteQueryResult(bool Exists, RouteState? Route, RouteNativeStatus Status = RouteNativeStatus.Success)
 {
     public bool IsExactMatch(RouteRestorationCommand command)
     {
@@ -258,9 +268,15 @@ public sealed class RouteRestorationProvider : IRestorationMutationProvider
         }
 
         var queryResult = await _native.QueryAsync(command, cancellationToken).ConfigureAwait(false);
+        if (queryResult.Status != RouteNativeStatus.Success)
+            return new RestorationMutationResult(request.OperationIdentity, RestorationMutationState.Failed, $"Route query failed with native status {queryResult.Status}.", false);
+
         var isExactMatch = queryResult.Exists && queryResult.IsExactMatch(command);
 
-        if (isExactMatch)
+        if (command.Action == RouteMutationAction.Delete && !queryResult.Exists)
+            return new RestorationMutationResult(request.OperationIdentity, RestorationMutationState.AlreadyRestored, "The route is already absent from the current state.", true);
+
+        if (command.Action == RouteMutationAction.Add && isExactMatch)
             return new RestorationMutationResult(request.OperationIdentity, RestorationMutationState.AlreadyRestored, "The expected route already exists in the current state.", true);
 
         if (queryResult.Exists && !isExactMatch)

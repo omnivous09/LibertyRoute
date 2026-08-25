@@ -130,7 +130,17 @@ public sealed class RouteRestorationProviderTests
     [Fact]
     public async Task EligibleOwnedRouteRemovalCallsFakeRemoveExactlyOnce()
     {
-        var native = new FakeRouteMutationNative();
+        var native = new FakeRouteMutationNative
+        {
+            CurrentRoute = new RouteState
+            {
+                Destination = "10.0.0.0/24",
+                NextHop = "10.0.0.1",
+                InterfaceIndex = 4,
+                Metric = 1,
+                AddressFamily = "2"
+            }
+        };
         var result = await ApplyAsync(native, Operation(
             DryRunOperationCategory.Route,
             "route-a",
@@ -161,7 +171,18 @@ public sealed class RouteRestorationProviderTests
     [InlineData(false, RestorationMutationState.Failed)]
     public async Task FakeRemoveOutcomeIsReported(bool succeeds, RestorationMutationState expectedState)
     {
-        var native = new FakeRouteMutationNative { RemoveSucceeds = succeeds };
+        var native = new FakeRouteMutationNative
+        {
+            RemoveSucceeds = succeeds,
+            CurrentRoute = new RouteState
+            {
+                Destination = "10.0.0.0/24",
+                NextHop = "10.0.0.1",
+                InterfaceIndex = 4,
+                Metric = 1,
+                AddressFamily = "2"
+            }
+        };
         var result = await ApplyAsync(native, Operation(
             DryRunOperationCategory.Route,
             "route-a",
