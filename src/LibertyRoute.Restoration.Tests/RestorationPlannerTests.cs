@@ -164,8 +164,173 @@ public sealed class RestorationPlannerTests
             .SelectMany(method => method.GetCustomAttributes(typeof(System.Runtime.InteropServices.DllImportAttribute), inherit: false)));
     }
 
+    [Fact]
+    public void IdenticalPlanProducesZeroOperations()
+    {
+        var result = DryRunRestorationExecutor.CreateDryRun(new RestorationPlan(Array.Empty<RestorationDifference>()));
+
+        Assert.Empty(result.Operations);
+        Assert.Equal(0, result.Summary.TotalDifferences);
+    }
+
+    [Fact]
+    public void MissingBaselineAddressProducesNonAutomaticRestoration()
+    {
+        var plan = RestorationPlanner.CreatePlan(Snapshot(Adapter("a", addresses: new[] { "192.0.2.1" })), Snapshot(Adapter("a")));
+        var operation = SingleOperation(plan, DryRunOperationCategory.Address);
+
+        Assert.Equal(DryRunAction.RestoreBaseline, operation.Action);
+        Assert.Equal(DryRunSafetyState.SafeToPlan, operation.SafetyState);
+        Assert.False(operation.AutomaticExecutionAllowed);
+        Assert.True(operation.OwnershipRequired);
+    }
+
+    [Fact]
+    public void AddedAddressProducesManualReviewAndNoDeletion()
+    {
+        var plan = RestorationPlanner.CreatePlan(Snapshot(Adapter("a")), Snapshot(Adapter("a", addresses: new[] { "192.0.2.2" })));
+        var operation = SingleOperation(plan, DryRunOperationCategory.Address);
+
+        Assert.Equal(DryRunAction.ManualReview, operation.Action);
+        Assert.Equal(DryRunSafetyState.ManualReview, operation.SafetyState);
+        Assert.Contains("not automatically deleted", operation.Reason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void MissingBaselineRouteProducesRestoration()
+    {
+        var result = DryRunRestorationExecutor.CreateDryRun(RestorationPlanner.CreatePlan(Snapshot(routes: new[] { Route("10.0.0.0/8") }), Snapshot()));
+
+        Assert.Equal(DryRunAction.RestoreBaseline, Assert.Single(result.Operations).Action);
+    }
+
+    [Fact]
+    public void AddedBaselineRouteProducesNoDeletion()
+    {
+        var result = DryRunRestorationExecutor.CreateDryRun(RestorationPlanner.CreatePlan(Snapshot(), Snapshot(routes: new[] { Route("10.0.0.0/8") })));
+
+        Assert.Equal(DryRunAction.ManualReview, Assert.Single(result.Operations).Action);
+    }
+
+    [Fact]
+    public void ChangedGatewayAndDnsProduceRestorationOperations()
+    {
+        var original = Snapshot(Adapter("a", gateways: new[] { "192.0.2.1" }, dns: new[] { "192.0.2.53" }));
+        var current = Snapshot(Adapter("a", gateways: new[] { "192.0.2.254" }, dns: new[] { "192.0.2.54" }));
+        var result = DryRunRestorationExecutor.CreateDryRun(RestorationPlanner.CreatePlan(original, current));
+
+        Assert.Contains(result.Operations, operation => operation.Category == DryRunOperationCategory.Gateway && operation.Action == DryRunAction.RestoreBaseline);
+        Assert.Contains(result.Operations, operation => operation.Category == DryRunOperationCategory.Dns && operation.Action == DryRunAction.RestoreBaseline);
+    }
+
+    [Fact]
+    public void ChangedRouteFieldsProduceRestorationOperations()
+    {
+        var original = Snapshot(routes: new[] { Route("10.0.0.0/8", "10.0.0.1", 4, 1) });
+        var current = Snapshot(routes: new[] { Route("10.0.0.0/8", "10.0.0.2", 8, 2) });
+        var result = DryRunRestorationExecutor.CreateDryRun(RestorationPlanner.CreatePlan(original, current));
+
+        var operation = Assert.Single(result.Operations);
+        Assert.Equal(DryRunOperationCategory.Route, operation.Category);
+        Assert.Equal(DryRunAction.RestoreBaseline, operation.Action);
+        Assert.Equal(DryRunSafetyState.SafeToPlan, operation.SafetyState);
+    }
+
+    [Fact]
+    public void MissingAdapterIsUnsupportedAndNeverAutomatic()
+    {
+        var result = DryRunRestorationExecutor.CreateDryRun(RestorationPlanner.CreatePlan(Snapshot(Adapter("a")), Snapshot()));
+        var operation = SingleOperation(result, DryRunOperationCategory.Adapter);
+
+        Assert.Equal(DryRunSafetyState.Unsupported, operation.SafetyState);
+        Assert.False(operation.AutomaticExecutionAllowed);
+    }
+
+    [Fact]
+    public void ExecutionOrderingAndNumberingAreStable()
+    {
+        var original = Snapshot(Adapter("a", addresses: new[] { "192.0.2.1" }, gateways: new[] { "192.0.2.1" }, dns: new[] { "192.0.2.53" }), new[] { Route("10.0.0.0/8") });
+        var current = Snapshot(Adapter("a", addresses: new[] { "192.0.2.2" }, gateways: new[] { "192.0.2.254" }, dns: new[] { "192.0.2.54" }), new[] { Route("10.0.0.0/8", "10.0.0.1", 8, 2) });
+        var first = DryRunRestorationExecutor.CreateDryRun(RestorationPlanner.CreatePlan(original, current));
+        var second = DryRunRestorationExecutor.CreateDryRun(RestorationPlanner.CreatePlan(original, current));
+
+        Assert.Equal(first.Operations, second.Operations);
+        Assert.Equal(first.Summary.TotalDifferences, second.Summary.TotalDifferences);
+        Assert.Equal(first.Summary.TotalOperations, second.Summary.TotalOperations);
+        Assert.Equal(first.Summary.SafeOperations, second.Summary.SafeOperations);
+        Assert.Equal(first.Summary.ManualReviewOperations, second.Summary.ManualReviewOperations);
+        Assert.Equal(first.Summary.UnsupportedOperations, second.Summary.UnsupportedOperations);
+        Assert.Equal(first.Summary.IsFullyExecutableInFuture, second.Summary.IsFullyExecutableInFuture);
+        Assert.Equal(first.Summary.BlockingReasons, second.Summary.BlockingReasons);
+        Assert.Equal(Enumerable.Range(1, first.Operations.Count), first.Operations.Select(operation => operation.ExecutionOrder));
+        Assert.Equal(first.Operations.OrderBy(operation => operation.Category switch
+        {
+            DryRunOperationCategory.Route => 30,
+            DryRunOperationCategory.Address => 40,
+            DryRunOperationCategory.Gateway => 50,
+            DryRunOperationCategory.Dns => 60,
+            _ => 80
+        }).ToArray(), first.Operations);
+    }
+
+    [Fact]
+    public void SummaryReportsSafetyBlockers()
+    {
+        var result = DryRunRestorationExecutor.CreateDryRun(RestorationPlanner.CreatePlan(Snapshot(Adapter("a")), Snapshot(Adapter("a", addresses: new[] { "192.0.2.2" }))));
+
+        Assert.Equal(1, result.Summary.TotalDifferences);
+        Assert.Equal(1, result.Summary.TotalOperations);
+        Assert.Equal(1, result.Summary.ManualReviewOperations);
+        Assert.False(result.Summary.IsFullyExecutableInFuture);
+        Assert.NotEmpty(result.Summary.BlockingReasons);
+    }
+
+    [Fact]
+    public void DryRunDoesNotAlterInputPlan()
+    {
+        var plan = RestorationPlanner.CreatePlan(Snapshot(Adapter("a")), Snapshot(Adapter("a", addresses: new[] { "192.0.2.2" })));
+        var before = plan.Differences.ToArray();
+
+        _ = DryRunRestorationExecutor.CreateDryRun(plan);
+
+        Assert.Equal(before, plan.Differences);
+    }
+
+    [Fact]
+    public void RestorationAssemblyHasNoWindowsOrMutationSurface()
+    {
+        var assembly = typeof(DryRunRestorationExecutor).Assembly;
+        Assert.DoesNotContain(assembly.GetTypes(), type => type.Namespace?.StartsWith("System.Net.NetworkInformation", StringComparison.Ordinal) == true || type.Namespace?.StartsWith("Microsoft.Win32", StringComparison.Ordinal) == true);
+        Assert.Empty(assembly.GetTypes().SelectMany(type => type.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Instance)).SelectMany(method => method.GetCustomAttributes(typeof(System.Runtime.InteropServices.DllImportAttribute), false)));
+        Assert.DoesNotContain(typeof(DryRunRestorationExecutor).GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static), method => method.Name.Contains("Apply", StringComparison.OrdinalIgnoreCase) || method.Name.Contains("ExecuteMutation", StringComparison.OrdinalIgnoreCase) || method.Name.Contains("Commit", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void RepeatedDryRunExecutionIsEquivalent()
+    {
+        var plan = RestorationPlanner.CreatePlan(Snapshot(Adapter("a", addresses: new[] { "192.0.2.1" })), Snapshot(Adapter("a")));
+
+        var first = DryRunRestorationExecutor.CreateDryRun(plan);
+        var second = DryRunRestorationExecutor.CreateDryRun(plan);
+
+        Assert.Equal(first.Operations, second.Operations);
+        Assert.Equal(first.Summary.TotalDifferences, second.Summary.TotalDifferences);
+        Assert.Equal(first.Summary.TotalOperations, second.Summary.TotalOperations);
+        Assert.Equal(first.Summary.SafeOperations, second.Summary.SafeOperations);
+        Assert.Equal(first.Summary.ManualReviewOperations, second.Summary.ManualReviewOperations);
+        Assert.Equal(first.Summary.UnsupportedOperations, second.Summary.UnsupportedOperations);
+        Assert.Equal(first.Summary.IsFullyExecutableInFuture, second.Summary.IsFullyExecutableInFuture);
+        Assert.True(first.Summary.BlockingReasons.SequenceEqual(second.Summary.BlockingReasons));
+    }
+
     private static RestorationDifference Single(NetworkStateSnapshot original, NetworkStateSnapshot current, RestorationCategory category)
         => Assert.Single(RestorationPlanner.CreatePlan(original, current).Differences, difference => difference.Category == category);
+
+    private static DryRunRestorationOperation SingleOperation(RestorationPlan plan, DryRunOperationCategory category)
+        => Assert.Single(DryRunRestorationExecutor.CreateDryRun(plan).Operations, operation => operation.Category == category);
+
+    private static DryRunRestorationOperation SingleOperation(DryRunRestorationResult result, DryRunOperationCategory category)
+        => Assert.Single(result.Operations, operation => operation.Category == category);
 
     private static NetworkStateSnapshot Snapshot(AdapterState? adapter = null, IReadOnlyList<RouteState>? routes = null)
         => new(DateTimeOffset.UnixEpoch, "test", adapter is null ? Array.Empty<AdapterState>() : new[] { adapter }, routes, null);
