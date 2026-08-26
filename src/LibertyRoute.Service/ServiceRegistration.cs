@@ -32,7 +32,6 @@ public static class LibertyRouteRegistration
 
         AddCoreRegistrations(services);
         services.AddSingleton<IOwnershipLedger, FileOwnershipLedger>();
-        services.AddSingleton<IRecordedMutationExecutorFactory, RecordedMutationExecutorFactory>();
         return services;
     }
 
@@ -50,7 +49,6 @@ public static class LibertyRouteRegistration
 
         AddCoreRegistrations(services);
         services.AddSingleton<IOwnershipLedger>(_ => new FileOwnershipLedger(ownershipLedgerRoot));
-        services.AddSingleton<IRecordedMutationExecutorFactory, RecordedMutationExecutorFactory>();
         return services;
     }
 

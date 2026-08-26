@@ -162,29 +162,59 @@ public sealed class ServiceCompositionTests
     }
 
     [Fact]
-    public async Task RecordedMutationExecutorFactoryResolvesWithoutCreatingProviderOrRecords()
+    public async Task RecordedMutationExecutorFactoryIsRegisteredExactlyOnceInProductionAndTestComposition()
     {
-        var tempRoot = Path.Combine(Path.GetTempPath(), "LibertyRoute.Tests.Composition", Guid.NewGuid().ToString("N"));
+        var productionRoot = Path.Combine(Path.GetTempPath(), "LibertyRoute.Tests.Composition", Guid.NewGuid().ToString("N"));
+        var testRoot = Path.Combine(Path.GetTempPath(), "LibertyRoute.Tests.Composition", Guid.NewGuid().ToString("N"));
         try
         {
-            var services = new ServiceCollection();
-            services.AddLibertyRouteCoreServicesForTests(tempRoot);
+            var productionServices = new ServiceCollection();
+            productionServices.AddLibertyRouteCoreServices();
+            var productionDescriptor = Assert.Single(
+                productionServices,
+                descriptor => descriptor.ServiceType == typeof(IRecordedMutationExecutorFactory));
+            Assert.Equal(typeof(RecordedMutationExecutorFactory), productionDescriptor.ImplementationType);
 
-            await using var provider = services.BuildServiceProvider();
-            var factory = provider.GetRequiredService<IRecordedMutationExecutorFactory>();
+            // Redirect only the ledger storage so resolving the production composition
+            // cannot touch the real ProgramData location during this test.
+            productionServices.Remove(Assert.Single(
+                productionServices,
+                descriptor => descriptor.ServiceType == typeof(IOwnershipLedger)));
+            productionServices.AddSingleton<IOwnershipLedger>(_ => new FileOwnershipLedger(productionRoot));
 
-            Assert.IsType<RecordedMutationExecutorFactory>(factory);
-            Assert.Empty(Directory.GetFiles(tempRoot, "*.lrw", SearchOption.AllDirectories));
-            Assert.Throws<ArgumentNullException>(() => factory.Create(Guid.NewGuid(), null!));
+            var testServices = new ServiceCollection();
+            testServices.AddLibertyRouteCoreServicesForTests(testRoot);
+            var testDescriptor = Assert.Single(
+                testServices,
+                descriptor => descriptor.ServiceType == typeof(IRecordedMutationExecutorFactory));
+            Assert.Equal(typeof(RecordedMutationExecutorFactory), testDescriptor.ImplementationType);
+
+            await using var productionProvider = productionServices.BuildServiceProvider();
+            await using var testProvider = testServices.BuildServiceProvider();
+
+            Assert.IsType<RecordedMutationExecutorFactory>(
+                productionProvider.GetRequiredService<IRecordedMutationExecutorFactory>());
+            Assert.IsType<RecordedMutationExecutorFactory>(
+                testProvider.GetRequiredService<IRecordedMutationExecutorFactory>());
+
+            Assert.Empty(Directory.GetFiles(productionRoot, "*.lrw", SearchOption.AllDirectories));
+            Assert.Empty(Directory.GetFiles(testRoot, "*.lrw", SearchOption.AllDirectories));
+            Assert.Throws<InvalidOperationException>(
+                () => productionProvider.GetRequiredService<IRestorationMutationProvider>());
+            Assert.Throws<InvalidOperationException>(
+                () => testProvider.GetRequiredService<IRestorationMutationProvider>());
         }
         finally
         {
-            try
+            foreach (var root in new[] { productionRoot, testRoot })
             {
-                Directory.Delete(tempRoot, recursive: true);
-            }
-            catch
-            {
+                try
+                {
+                    Directory.Delete(root, recursive: true);
+                }
+                catch
+                {
+                }
             }
         }
     }
