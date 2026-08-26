@@ -15,6 +15,7 @@
     </PackageReference>
   </ItemGroup>
   <ItemGroup>
+    <ProjectReference Include="..\LibertyRoute.ControlProtocol\LibertyRoute.ControlProtocol.csproj" />
     <ProjectReference Include="..\LibertyRoute.Core\LibertyRoute.Core.csproj" />
     <ProjectReference Include="..\LibertyRoute.Restoration\LibertyRoute.Restoration.csproj" />
     <ProjectReference Include="..\LibertyRoute.Restoration.Windows\LibertyRoute.Restoration.Windows.csproj" />

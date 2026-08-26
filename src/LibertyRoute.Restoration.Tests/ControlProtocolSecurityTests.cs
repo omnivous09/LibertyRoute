@@ -1,0 +1,358 @@
+using System.Buffers.Binary;
+using System.Text;
+using LibertyRoute.ControlProtocol;
+
+namespace LibertyRoute.Restoration.Tests;
+
+public sealed class ControlProtocolSecurityTests
+{
+    private static ControlRequestEnvelope Request(ControlCommand command = ControlCommand.Status) => new(
+        ControlProtocolConstants.Version,
+        Guid.NewGuid(),
+        Guid.NewGuid(),
+        DateTimeOffset.Parse("2026-01-02T03:04:05+00:00"),
+        command,
+        new ControlRequestPayload());
+
+    private static ControlResponseEnvelope Response(string? result = "bounded-result") => new(
+        ControlProtocolConstants.Version,
+        Guid.NewGuid(),
+        Guid.NewGuid(),
+        ControlOutcome.Succeeded,
+        ControlErrorCode.None,
+        result);
+
+    [Fact]
+    public async Task ValidRequestRoundTrips()
+    {
+        var expected = Request(ControlCommand.Connect);
+        await using var stream = new MemoryStream();
+
+        await LengthPrefixedJsonProtocol.WriteRequestAsync(stream, expected);
+        stream.Position = 0;
+
+        Assert.Equal(expected, await LengthPrefixedJsonProtocol.ReadRequestAsync(stream));
+    }
+
+    [Fact]
+    public async Task ValidResponseRoundTripsWithTransitionalBoundedResult()
+    {
+        var expected = Response("opaque diagnostic text");
+        await using var stream = new MemoryStream();
+
+        await LengthPrefixedJsonProtocol.WriteResponseAsync(stream, expected);
+        stream.Position = 0;
+
+        Assert.Equal(expected, await LengthPrefixedJsonProtocol.ReadResponseAsync(stream));
+    }
+
+    [Theory]
+    [InlineData(ControlCommand.Status, "STATUS")]
+    [InlineData(ControlCommand.Snapshot, "SNAPSHOT")]
+    [InlineData(ControlCommand.Connect, "CONNECT")]
+    [InlineData(ControlCommand.Disconnect, "DISCONNECT")]
+    public async Task ExactlyFourCommandsHaveStableWireNames(ControlCommand command, string wireName)
+    {
+        Assert.Equal(4, Enum.GetValues<ControlCommand>().Length);
+        await using var stream = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteRequestAsync(stream, Request(command));
+        var json = Encoding.UTF8.GetString(stream.ToArray()[ControlProtocolConstants.LengthPrefixSize..]);
+        Assert.Contains($"\"command\":\"{wireName}\"", json, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UnsupportedVersionIsRejected()
+    {
+        var request = Request() with { ProtocolVersion = 2 };
+        var exception = await Assert.ThrowsAsync<ControlProtocolException>(
+            () => LengthPrefixedJsonProtocol.WriteRequestAsync(new MemoryStream(), request));
+        Assert.Equal(ControlProtocolError.UnsupportedVersion, exception.Error);
+    }
+
+    [Theory]
+    [InlineData("FUTURE")]
+    [InlineData("status")]
+    [InlineData("0")]
+    public async Task UnknownOrInexactCommandIsRejected(string command)
+    {
+        var json = ValidRequestJson().Replace("\"STATUS\"", $"\"{command}\"", StringComparison.Ordinal);
+        var exception = await ReadRequestFailureAsync(json);
+        Assert.Equal(ControlProtocolError.UnknownCommand, exception.Error);
+    }
+
+    [Theory]
+    [InlineData("serviceInstanceId")]
+    [InlineData("requestId")]
+    public async Task EmptyIdentifiersAreRejected(string property)
+    {
+        var json = ValidRequestJson().ReplacePropertyValue(property, "\"00000000-0000-0000-0000-000000000000\"");
+        var exception = await ReadRequestFailureAsync(json);
+        Assert.Equal(ControlProtocolError.InvalidContract, exception.Error);
+    }
+
+    [Theory]
+    [InlineData("protocolVersion")]
+    [InlineData("serviceInstanceId")]
+    [InlineData("requestId")]
+    [InlineData("sentAtUtc")]
+    [InlineData("command")]
+    [InlineData("payload")]
+    public async Task MissingRequiredRequestMemberIsRejected(string property)
+    {
+        var json = RemoveProperty(ValidRequestJson(), property);
+        await Assert.ThrowsAsync<ControlProtocolException>(() => ReadRequestAsync(json));
+    }
+
+    [Fact]
+    public async Task WrongMemberTypeIsRejected()
+    {
+        var json = ValidRequestJson().ReplacePropertyValue("requestId", "17");
+        var exception = await ReadRequestFailureAsync(json);
+        Assert.Equal(ControlProtocolError.MalformedJson, exception.Error);
+    }
+
+    [Fact]
+    public async Task ExtraAndDuplicateMembersAreRejected()
+    {
+        var extra = ValidRequestJson().Replace("\"payload\":{}", "\"payload\":{},\"extra\":true", StringComparison.Ordinal);
+        var duplicate = ValidRequestJson().Replace("\"payload\":{}", "\"payload\":{},\"requestId\":\"11111111-1111-1111-1111-111111111111\"", StringComparison.Ordinal);
+
+        Assert.Equal(ControlProtocolError.MalformedJson, (await ReadRequestFailureAsync(extra)).Error);
+        Assert.Equal(ControlProtocolError.MalformedJson, (await ReadRequestFailureAsync(duplicate)).Error);
+    }
+
+    [Fact]
+    public async Task EmptyPayloadRejectsArbitraryInstructionMembers()
+    {
+        var json = ValidRequestJson().Replace("\"payload\":{}", "\"payload\":{\"route\":\"0.0.0.0/0\"}", StringComparison.Ordinal);
+        Assert.Equal(ControlProtocolError.MalformedJson, (await ReadRequestFailureAsync(json)).Error);
+        Assert.Empty(typeof(ControlRequestPayload).GetProperties());
+    }
+
+    [Fact]
+    public async Task MalformedJsonIsRejected()
+    {
+        Assert.Equal(ControlProtocolError.MalformedJson, (await ReadRequestFailureAsync("{")).Error);
+    }
+
+    [Fact]
+    public async Task PrefixIsFourByteBigEndianAndOneFrameIsReadAtATime()
+    {
+        await using var first = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteRequestAsync(first, Request());
+        var firstBytes = first.ToArray();
+        Assert.Equal(firstBytes.Length - 4, BinaryPrimitives.ReadInt32BigEndian(firstBytes.AsSpan(0, 4)));
+
+        await using var second = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteRequestAsync(second, Request(ControlCommand.Snapshot));
+        var combined = firstBytes.Concat(second.ToArray()).ToArray();
+        await using var stream = new MemoryStream(combined);
+
+        Assert.Equal(ControlCommand.Status, (await LengthPrefixedJsonProtocol.ReadRequestAsync(stream)).Command);
+        Assert.Equal(firstBytes.Length, stream.Position);
+        Assert.Equal(ControlCommand.Snapshot, (await LengthPrefixedJsonProtocol.ReadRequestAsync(stream)).Command);
+    }
+
+    [Theory]
+    [InlineData(0, ControlProtocolError.ZeroLengthFrame)]
+    [InlineData(-1, ControlProtocolError.InvalidLengthPrefix)]
+    [InlineData(ControlProtocolConstants.MaximumRequestSize + 1, ControlProtocolError.FrameTooLarge)]
+    public async Task InvalidRequestLengthsAreRejectedBeforePayloadRead(int length, ControlProtocolError expected)
+    {
+        var prefix = new byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(prefix, length);
+        var exception = await Assert.ThrowsAsync<ControlProtocolException>(
+            () => LengthPrefixedJsonProtocol.ReadRequestAsync(new MemoryStream(prefix)));
+        Assert.Equal(expected, exception.Error);
+    }
+
+    [Fact]
+    public async Task OversizedResponseWriteProducesNoPartialFrame()
+    {
+        await using var stream = new MemoryStream();
+        var exception = await Assert.ThrowsAsync<ControlProtocolException>(() =>
+            LengthPrefixedJsonProtocol.WriteResponseAsync(
+                stream,
+                Response(new string('x', ControlProtocolConstants.MaximumResponseSize))));
+
+        Assert.Equal(ControlProtocolError.FrameTooLarge, exception.Error);
+        Assert.Equal(0, stream.Length);
+    }
+
+    [Fact]
+    public async Task InvalidSerializableEnvelopeReturnsStableErrorWithoutWriting()
+    {
+        await using var stream = new MemoryStream();
+        var invalid = Response() with { Outcome = (ControlOutcome)int.MaxValue };
+
+        var exception = await Assert.ThrowsAsync<ControlProtocolException>(() =>
+            LengthPrefixedJsonProtocol.WriteResponseAsync(stream, invalid));
+
+        Assert.IsNotType<System.Text.Json.JsonException>(exception);
+        Assert.Equal(ControlProtocolError.InvalidContract, exception.Error);
+        Assert.Equal(0, stream.Length);
+    }
+
+    [Fact]
+    public async Task TruncatedPrefixAndPayloadAreRejected()
+    {
+        var prefixException = await Assert.ThrowsAsync<ControlProtocolException>(() =>
+            LengthPrefixedJsonProtocol.ReadRequestAsync(new MemoryStream(new byte[3])));
+
+        var frame = new byte[6];
+        BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(0, 4), 10);
+        var payloadException = await Assert.ThrowsAsync<ControlProtocolException>(() =>
+            LengthPrefixedJsonProtocol.ReadRequestAsync(new MemoryStream(frame)));
+
+        Assert.Equal(ControlProtocolError.TruncatedFrame, prefixException.Error);
+        Assert.Equal(ControlProtocolError.TruncatedFrame, payloadException.Error);
+    }
+
+    [Fact]
+    public async Task PartialStreamReadsAreCombinedExactly()
+    {
+        await using var framed = new MemoryStream();
+        var expected = Request(ControlCommand.Disconnect);
+        await LengthPrefixedJsonProtocol.WriteRequestAsync(framed, expected);
+        await using var partial = new PartialReadStream(framed.ToArray());
+
+        Assert.Equal(expected, await LengthPrefixedJsonProtocol.ReadRequestAsync(partial));
+    }
+
+    [Fact]
+    public async Task InvalidUtf8IsRejected()
+    {
+        var frame = new byte[6];
+        BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(0, 4), 2);
+        frame[4] = 0xC3;
+        frame[5] = 0x28;
+
+        var exception = await Assert.ThrowsAsync<ControlProtocolException>(() =>
+            LengthPrefixedJsonProtocol.ReadRequestAsync(new MemoryStream(frame)));
+        Assert.Equal(ControlProtocolError.InvalidUtf8, exception.Error);
+    }
+
+    [Fact]
+    public void ProtocolProjectIsAPlatformNeutralDependencyLeafAndProductionIpcIsUnchanged()
+    {
+        var root = FindRepositoryRoot();
+        var projectDirectory = Path.Combine(root, "src", "LibertyRoute.ControlProtocol");
+        var project = File.ReadAllText(Path.Combine(projectDirectory, "LibertyRoute.ControlProtocol.csproj"));
+        var protocolSource = string.Join('\n', Directory.GetFiles(projectDirectory, "*.cs").Select(File.ReadAllText));
+        var serviceProject = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Service", "LibertyRoute.Service.csproj"));
+        var desktopProject = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Desktop", "LibertyRoute.Desktop.csproj"));
+        var worker = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Service", "LibertyRouteWorker.cs"));
+        var desktop = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Desktop", "MainWindow.xaml.cs"));
+
+        Assert.Contains("<TargetFramework>net10.0</TargetFramework>", project, StringComparison.Ordinal);
+        Assert.DoesNotContain("ProjectReference", project, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.ControlProtocol", serviceProject, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.ControlProtocol", desktopProject, StringComparison.Ordinal);
+        Assert.Contains("ReadLineAsync", worker, StringComparison.Ordinal);
+        Assert.Contains("WriteLineAsync(command)", desktop, StringComparison.Ordinal);
+
+        var privilegedTypeTerms = new[]
+        {
+            "Route", "Dns", "Gateway", "Provider", "Native", "Restoration",
+            "Approval", "Grant", "Capability", "OwnedNetworkChange"
+        };
+        var protocolTypes = typeof(ControlRequestEnvelope).Assembly.GetTypes();
+        Assert.All(protocolTypes, type =>
+            Assert.All(privilegedTypeTerms, term =>
+                Assert.DoesNotContain(term, type.Name, StringComparison.OrdinalIgnoreCase)));
+
+        var forbidden = new[]
+        {
+            "NamedPipeServerStream", "NamedPipeClientStream", "PipeSecurity", "WindowsIdentity",
+            "SecurityIdentifier", "RunAsClient", "RestorationExecutionCapability",
+            "ControlledRestorationActivationGrant", "ControlledRecoveryApproval",
+            "ControlledApprovedRecoveryExecution", "RouteMutationProviderFactory",
+            "WindowsRouteMutationNative", "IRouteMutationNative", "RecordRevertedAsync",
+            "IServiceProvider", "IConfiguration", "Environment.GetEnvironmentVariable",
+            "Process.Start", "powershell", "pwsh", "netsh", "Set-Net", "New-Net",
+            "Remove-Net", "Add-Net", "Registry", "private key", "password", "credential", "secret"
+        };
+        Assert.All(forbidden, term => Assert.DoesNotContain(term, protocolSource, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static async Task<ControlProtocolException> ReadRequestFailureAsync(string json)
+        => await Assert.ThrowsAsync<ControlProtocolException>(() => ReadRequestAsync(json));
+
+    private static Task<ControlRequestEnvelope> ReadRequestAsync(string json)
+        => LengthPrefixedJsonProtocol.ReadRequestAsync(Frame(json));
+
+    private static MemoryStream Frame(string json)
+    {
+        var payload = Encoding.UTF8.GetBytes(json);
+        var frame = new byte[payload.Length + 4];
+        BinaryPrimitives.WriteInt32BigEndian(frame.AsSpan(0, 4), payload.Length);
+        payload.CopyTo(frame.AsSpan(4));
+        return new MemoryStream(frame);
+    }
+
+    private static string ValidRequestJson()
+        => "{\"protocolVersion\":1,\"serviceInstanceId\":\"11111111-1111-1111-1111-111111111111\",\"requestId\":\"22222222-2222-2222-2222-222222222222\",\"sentAtUtc\":\"2026-01-02T03:04:05+00:00\",\"command\":\"STATUS\",\"payload\":{}}";
+
+    private static string RemoveProperty(string json, string property)
+    {
+        var marker = $"\"{property}\":";
+        var start = json.IndexOf(marker, StringComparison.Ordinal);
+        var end = start + marker.Length;
+        var depth = 0;
+        var quoted = false;
+        while (end < json.Length)
+        {
+            var character = json[end];
+            if (character == '"' && (end == 0 || json[end - 1] != '\\')) quoted = !quoted;
+            if (!quoted)
+            {
+                if (character is '{' or '[') depth++;
+                if (character is '}' or ']')
+                {
+                    if (depth == 0) break;
+                    depth--;
+                }
+                if (character == ',' && depth == 0) break;
+            }
+            end++;
+        }
+        if (end < json.Length && json[end] == ',') end++;
+        else if (start > 1 && json[start - 1] == ',') start--;
+        return json.Remove(start, end - start);
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory is not null && !File.Exists(Path.Combine(directory.FullName, "LibertyRoute.sln")))
+            directory = directory.Parent;
+        return directory?.FullName ?? throw new DirectoryNotFoundException("Repository root not found.");
+    }
+
+    private sealed class PartialReadStream(byte[] bytes) : MemoryStream(bytes)
+    {
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+            => base.ReadAsync(buffer[..Math.Min(1, buffer.Length)], cancellationToken);
+    }
+}
+
+internal static class JsonTestExtensions
+{
+    public static string ReplacePropertyValue(this string json, string property, string replacement)
+    {
+        var marker = $"\"{property}\":";
+        var start = json.IndexOf(marker, StringComparison.Ordinal) + marker.Length;
+        var end = start;
+        if (json[start] == '"')
+        {
+            end++;
+            while (json[end] != '"' || json[end - 1] == '\\') end++;
+            end++;
+        }
+        else
+        {
+            while (end < json.Length && json[end] is not ',' and not '}') end++;
+        }
+        return json[..start] + replacement + json[end..];
+    }
+}
