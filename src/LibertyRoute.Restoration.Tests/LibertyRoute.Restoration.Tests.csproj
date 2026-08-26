@@ -18,5 +18,6 @@
     <ProjectReference Include="..\LibertyRoute.Core\LibertyRoute.Core.csproj" />
     <ProjectReference Include="..\LibertyRoute.Restoration\LibertyRoute.Restoration.csproj" />
     <ProjectReference Include="..\LibertyRoute.Restoration.Windows\LibertyRoute.Restoration.Windows.csproj" />
+    <ProjectReference Include="..\LibertyRoute.Service\LibertyRoute.Service.csproj" />
   </ItemGroup>
 </Project>
