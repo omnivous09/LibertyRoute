@@ -6,6 +6,8 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\LibertyRoute.Core\LibertyRoute.Core.csproj" />
+    <ProjectReference Include="..\LibertyRoute.Networking\LibertyRoute.Networking.csproj" />
+    <ProjectReference Include="..\LibertyRoute.Recovery\LibertyRoute.Recovery.csproj" />
     <ProjectReference Include="..\LibertyRoute.Restoration\LibertyRoute.Restoration.csproj" />
   </ItemGroup>
 </Project>
