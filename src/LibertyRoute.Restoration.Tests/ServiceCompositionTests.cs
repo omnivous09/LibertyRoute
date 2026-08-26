@@ -161,6 +161,34 @@ public sealed class ServiceCompositionTests
         Assert.Throws<InvalidOperationException>(() => provider.GetRequiredService<IRestorationMutationProvider>());
     }
 
+    [Fact]
+    public async Task RecordedMutationExecutorFactoryResolvesWithoutCreatingProviderOrRecords()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "LibertyRoute.Tests.Composition", Guid.NewGuid().ToString("N"));
+        try
+        {
+            var services = new ServiceCollection();
+            services.AddLibertyRouteCoreServicesForTests(tempRoot);
+
+            await using var provider = services.BuildServiceProvider();
+            var factory = provider.GetRequiredService<IRecordedMutationExecutorFactory>();
+
+            Assert.IsType<RecordedMutationExecutorFactory>(factory);
+            Assert.Empty(Directory.GetFiles(tempRoot, "*.lrw", SearchOption.AllDirectories));
+            Assert.Throws<ArgumentNullException>(() => factory.Create(Guid.NewGuid(), null!));
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+            catch
+            {
+            }
+        }
+    }
+
     // --- Constructor dependency guards ---
 
     [Fact]
@@ -226,6 +254,7 @@ public sealed class ServiceCompositionTests
         var forbiddenCalls = new[]
         {
             "AppendAsync",
+            "ApplyAsync(",
             "ExecuteAuthorizedMutationAsync",
             "RecordRevertedAsync"
         };
