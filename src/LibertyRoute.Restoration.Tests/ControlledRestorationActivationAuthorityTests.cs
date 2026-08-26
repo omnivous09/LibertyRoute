@@ -56,8 +56,11 @@ public sealed class ControlledRestorationActivationAuthorityTests
 
         public int CallCount { get; private set; }
 
-        public RestorationExecutionPreflight Create(RestorationOrchestrationPreparation preparation)
+        public RestorationExecutionPreflight Create(
+            RestorationOrchestrationPreparation preparation,
+            CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             CallCount++;
             return _factory.Create(
                 preparation.ExecutionPreparation,

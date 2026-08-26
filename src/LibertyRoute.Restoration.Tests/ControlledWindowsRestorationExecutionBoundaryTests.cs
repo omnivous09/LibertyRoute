@@ -131,8 +131,11 @@ public sealed class ControlledWindowsRestorationExecutionBoundaryTests
 
         public int CallCount { get; private set; }
 
-        public RestorationExecutionPreflight Create(RestorationOrchestrationPreparation preparation)
+        public RestorationExecutionPreflight Create(
+            RestorationOrchestrationPreparation preparation,
+            CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             CallCount++;
             return _create();
         }
@@ -147,8 +150,11 @@ public sealed class ControlledWindowsRestorationExecutionBoundaryTests
 
         public int CallCount { get; private set; }
 
-        public RestorationExecutionPreflight Create(RestorationOrchestrationPreparation preparation)
+        public RestorationExecutionPreflight Create(
+            RestorationOrchestrationPreparation preparation,
+            CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             CallCount++;
             return _factory.Create(
                 preparation.ExecutionPreparation,
@@ -241,7 +247,7 @@ public sealed class ControlledWindowsRestorationExecutionBoundaryTests
         });
         var gate = new CapabilityUnavailableRestorationProviderGate(factory);
 
-        var result = gate.Create(Preparation());
+        var result = gate.Create(Preparation(), CancellationToken.None);
 
         Assert.Equal(RestorationExecutionGateStatus.Disabled, result.Status);
         Assert.Null(result.Provider);

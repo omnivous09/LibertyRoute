@@ -34,7 +34,9 @@ public interface IControlledWindowsRestorationExecutionBoundary
 /// </summary>
 internal interface IControlledRestorationProviderGate
 {
-    RestorationExecutionPreflight Create(RestorationOrchestrationPreparation preparation);
+    RestorationExecutionPreflight Create(
+        RestorationOrchestrationPreparation preparation,
+        CancellationToken cancellationToken);
 }
 
 internal sealed class CapabilityUnavailableRestorationProviderGate
@@ -53,9 +55,12 @@ internal sealed class CapabilityUnavailableRestorationProviderGate
         _providerFactory = providerFactory ?? throw new ArgumentNullException(nameof(providerFactory));
     }
 
-    public RestorationExecutionPreflight Create(RestorationOrchestrationPreparation preparation)
+    public RestorationExecutionPreflight Create(
+        RestorationOrchestrationPreparation preparation,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(preparation);
+        cancellationToken.ThrowIfCancellationRequested();
         return _providerFactory.Create(
             preparation.ExecutionPreparation,
             preparation.ActiveSessionId,
@@ -104,7 +109,7 @@ public sealed class ControlledWindowsRestorationExecutionBoundary
         ArgumentNullException.ThrowIfNull(preparation);
         cancellationToken.ThrowIfCancellationRequested();
 
-        var preflight = _providerGate.Create(preparation);
+        var preflight = _providerGate.Create(preparation, cancellationToken);
         if (!preflight.IsEnabled || preflight.Provider is null)
         {
             return new ControlledRestorationExecutionResult(

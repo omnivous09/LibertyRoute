@@ -9,7 +9,8 @@ public enum RestorationExecutionGateStatus
     BlockedByAuthorization,
     BlockedByBatch,
     InvalidCapability,
-    SessionMismatch
+    SessionMismatch,
+    ProviderConstructionFailed
 }
 
 public sealed record RestorationExecutionPreflight(
@@ -37,6 +38,14 @@ internal sealed class RestorationExecutionCapability
 
     internal static RestorationExecutionCapability CreateInvalidForControlledTest()
         => new(new object());
+
+    /// <summary>
+    /// Narrow production seam used only by the preparation-bound, one-shot activation
+    /// handoff. The returned token must remain local to that handoff's synchronous
+    /// provider-gate call and must never be exposed, stored, cached, or registered.
+    /// </summary>
+    internal static RestorationExecutionCapability CreateForActivationHandoff()
+        => new(ValidMarker);
 }
 
 internal interface IRestorationMutationProviderFactory
