@@ -9,7 +9,19 @@ using LibertyRoute.Restoration;
 
 namespace LibertyRoute.Restoration.Windows;
 
-internal sealed record RecoveryRestorationRequest(Guid SessionId);
+internal sealed record RecoveryRestorationRequest(
+    Guid SessionId,
+    string? ExpectedJournalFingerprint = null);
+
+internal readonly record struct ControlledRecoveryJournalMarker(string Sha256)
+{
+    internal static ControlledRecoveryJournalMarker Create(NetworkTransaction transaction)
+    {
+        ArgumentNullException.ThrowIfNull(transaction);
+        var json = JsonSerializer.Serialize(transaction);
+        return new(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(json))));
+    }
+}
 
 internal enum RecoveryRestorationWorkflowStatus
 {
@@ -54,6 +66,7 @@ internal sealed class ControlledRecoveryRestorationWorkflow
     private readonly IRecordedMutationExecutorFactory _executorFactory;
     private readonly IControlledRestorationActivationAuthority _authority;
     private readonly IRestorationMutationProviderFactory _providerFactory;
+    private readonly Action<RestorationOrchestrationPreparation>? _bindApprovedPreparation;
 
     internal ControlledRecoveryRestorationWorkflow(
         ITransactionJournal journal,
@@ -76,7 +89,8 @@ internal sealed class ControlledRecoveryRestorationWorkflow
         IRestorationExecutionOrchestrator orchestrator,
         IRecordedMutationExecutorFactory executorFactory,
         IControlledRestorationActivationAuthority authority,
-        IRestorationMutationProviderFactory providerFactory)
+        IRestorationMutationProviderFactory providerFactory,
+        Action<RestorationOrchestrationPreparation>? bindApprovedPreparation = null)
     {
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
         _network = network ?? throw new ArgumentNullException(nameof(network));
@@ -84,6 +98,7 @@ internal sealed class ControlledRecoveryRestorationWorkflow
         _executorFactory = executorFactory ?? throw new ArgumentNullException(nameof(executorFactory));
         _authority = authority ?? throw new ArgumentNullException(nameof(authority));
         _providerFactory = providerFactory ?? throw new ArgumentNullException(nameof(providerFactory));
+        _bindApprovedPreparation = bindApprovedPreparation;
     }
 
     internal async Task<RecoveryRestorationWorkflowResult> ExecuteAsync(
@@ -103,14 +118,19 @@ internal sealed class ControlledRecoveryRestorationWorkflow
             if (initialValidation is not null)
                 return initialValidation;
 
-            var marker = JournalMarker.Create(journal!);
+            var marker = ControlledRecoveryJournalMarker.Create(journal!);
+            if (request.ExpectedJournalFingerprint is not null &&
+                !StringComparer.Ordinal.Equals(request.ExpectedJournalFingerprint, marker.Sha256))
+            {
+                return Result(RecoveryRestorationWorkflowStatus.JournalChanged, request.SessionId, journal!.State, "The active recovery journal no longer matches the explicitly approved candidate.");
+            }
             var current = await _network.CaptureStateAsync(cancellationToken).ConfigureAwait(false);
 
             journal = await _journal.ReadActiveAsync(cancellationToken).ConfigureAwait(false);
             var postCaptureValidation = ValidateJournal(request, journal);
             if (postCaptureValidation is not null)
                 return postCaptureValidation;
-            if (!marker.Equals(JournalMarker.Create(journal!)))
+            if (!marker.Equals(ControlledRecoveryJournalMarker.Create(journal!)))
                 return Result(RecoveryRestorationWorkflowStatus.JournalChanged, request.SessionId, journal?.State, "The active recovery journal changed while current state was captured.");
 
             var dryRun = DryRunRestorationExecutor.CreateDryRun(
@@ -143,9 +163,11 @@ internal sealed class ControlledRecoveryRestorationWorkflow
             var preAuthorityValidation = ValidateJournal(request, currentJournal);
             if (preAuthorityValidation is not null)
                 return preAuthorityValidation;
-            if (!marker.Equals(JournalMarker.Create(currentJournal!)))
+            if (!marker.Equals(ControlledRecoveryJournalMarker.Create(currentJournal!)))
                 return Result(RecoveryRestorationWorkflowStatus.JournalChanged, request.SessionId, currentJournal?.State, "The active recovery journal changed before activation authorization.", operationCount);
 
+            _bindApprovedPreparation?.Invoke(preparation);
+            cancellationToken.ThrowIfCancellationRequested();
             var activation = await _authority.AuthorizeAsync(preparation, cancellationToken).ConfigureAwait(false);
             if (activation.Status != ControlledRestorationActivationStatus.Authorized || activation.Grant is null)
             {
@@ -252,12 +274,4 @@ internal sealed class ControlledRecoveryRestorationWorkflow
         int operationCount = 0)
         => new(status, sessionId, state, operationCount, Array.Empty<string>(), null, null, reason);
 
-    private readonly record struct JournalMarker(string Sha256)
-    {
-        internal static JournalMarker Create(NetworkTransaction transaction)
-        {
-            var json = JsonSerializer.Serialize(transaction);
-            return new(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(json))));
-        }
-    }
 }

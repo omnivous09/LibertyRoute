@@ -221,6 +221,21 @@ public sealed class ControlledRecoveryRestorationWorkflowTests
         Assert.Equal(0, orchestrator.PrepareCount);
     }
 
+    [Fact]
+    public async Task ApprovedCandidateFingerprintMismatchFailsBeforeCurrentStateCapture()
+    {
+        var session = Guid.NewGuid();
+        var network = new Network(Snapshot());
+        var result = await Workflow(
+                new Journal { Active = Transaction(session) },
+                network,
+                new Ledger(Applied(session)))
+            .ExecuteAsync(new RecoveryRestorationRequest(session, "STALE-CANDIDATE"), CancellationToken.None);
+
+        Assert.Equal(RecoveryRestorationWorkflowStatus.JournalChanged, result.Status);
+        Assert.Equal(0, network.CaptureCount);
+    }
+
     [Theory]
     [InlineData(2, "missing", "NoUnfinishedRecovery")]
     [InlineData(3, "missing", "NoUnfinishedRecovery")]
