@@ -2,6 +2,10 @@ using System.IO.Pipes;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using LibertyRoute.ControlProtocol;
+using LibertyRoute.Core;
+using LibertyRoute.Engine;
+using LibertyRoute.Networking;
+using LibertyRoute.Recovery;
 using LibertyRoute.Service;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -147,6 +151,79 @@ public sealed class ControlPipeSecurityTests
     }
 
     [Fact]
+    public async Task ProductionDispatcherMapsStatusSnapshotConnectAndDisconnectExactly()
+    {
+        var snapshot = DiagnosticSnapshot();
+        var network = new FakeNetworkStateManager(snapshot);
+        var journal = new FakeTransactionJournal();
+        var engine = new FakeConnectionEngine();
+        var controller = new ConnectionController(network, journal, engine);
+        var dispatcher = new ControlCommandDispatcher(controller);
+        var caller = Caller("S-1-5-21-1");
+
+        var status = await dispatcher.DispatchAsync(caller, Request(), CancellationToken.None);
+        Assert.Equal(ControlConnectionState.Disconnected, Assert.IsType<ControlStatusResult>(status.Result).State);
+
+        var snapshotResult = await dispatcher.DispatchAsync(caller, Request() with { Command = ControlCommand.Snapshot }, CancellationToken.None);
+        var mapped = Assert.IsType<ControlSnapshotResult>(snapshotResult.Result).Snapshot;
+        Assert.Equal(1, network.Captures);
+        Assert.Equal(Now, mapped.CapturedAtUtc);
+        Assert.Equal("machine", mapped.MachineName);
+        var adapter = Assert.Single(mapped.Adapters);
+        Assert.Equal(("id", "name", "description", "Ethernet", "Up"),
+            (adapter.Id, adapter.Name, adapter.Description, adapter.NetworkInterfaceType, adapter.OperationalStatus));
+        Assert.Equal(new[] { "10.0.0.2" }, adapter.UnicastAddresses);
+        Assert.Equal(new[] { "10.0.0.1" }, adapter.Gateways);
+        Assert.Equal(new[] { "1.1.1.1" }, adapter.DnsServers);
+        var route = Assert.Single(mapped.Routes!);
+        Assert.Equal(("0.0.0.0/0", "10.0.0.1", 7, uint.MaxValue, "InterNetwork"),
+            (route.Destination, route.NextHop, route.InterfaceIndex, route.Metric, route.AddressFamily));
+        var dns = Assert.Single(mapped.DnsInterfaces!);
+        Assert.Equal(("id", "name", true), (dns.InterfaceId, dns.InterfaceName, dns.IsUp));
+        Assert.Equal(new[] { "1.1.1.1" }, dns.DnsServers);
+        Assert.Null(dns.IPv4DnsServers);
+        Assert.Empty(dns.IPv6DnsServers!);
+        Assert.Equal(ControlDnsConfigurationSource.Unknown, dns.IPv4ConfigurationSource);
+        Assert.Equal(ControlDnsConfigurationSource.Unknown, dns.IPv6ConfigurationSource);
+        Assert.Null(dns.IPv4StaticDnsServers);
+        Assert.Null(dns.IPv4DhcpDnsServers);
+        Assert.Null(dns.IPv6StaticDnsServers);
+        Assert.Null(dns.IPv6DhcpDnsServers);
+
+        var connect = await dispatcher.DispatchAsync(caller, Request() with { Command = ControlCommand.Connect }, CancellationToken.None);
+        Assert.Equal(ControlConnectionState.SnapshotCommitted, Assert.IsType<ControlConnectResult>(connect.Result).State);
+        Assert.Equal(2, network.Captures);
+        Assert.Equal(1, journal.Writes);
+
+        var disconnect = await dispatcher.DispatchAsync(caller, Request() with { Command = ControlCommand.Disconnect }, CancellationToken.None);
+        Assert.Equal(ControlConnectionState.Disconnected, Assert.IsType<ControlDisconnectResult>(disconnect.Result).State);
+        Assert.Equal(1, engine.Stops);
+        Assert.Equal(1, network.Verifications);
+        Assert.Equal(1, journal.Clears);
+    }
+
+    [Fact]
+    public void ProductionDispatcherStateAndDnsMappingsAreExhaustive()
+    {
+        foreach (var state in Enum.GetValues<ConnectionState>())
+            Assert.Equal(state.ToString(), ControlCommandDispatcher.MapState(state).ToString());
+        Assert.Throws<InvalidOperationException>(() => ControlCommandDispatcher.MapState((ConnectionState)int.MaxValue));
+        foreach (var source in Enum.GetValues<DnsConfigurationSource>())
+            Assert.Equal(source.ToString(), ControlCommandDispatcher.MapDnsSource(source).ToString());
+        Assert.Throws<InvalidOperationException>(() => ControlCommandDispatcher.MapDnsSource((DnsConfigurationSource)int.MaxValue));
+    }
+
+    [Fact]
+    public void ProductionSnapshotMappingRejectsCorruptRequiredRuntimeNulls()
+    {
+        var invalidMachine = DiagnosticSnapshot() with { MachineName = null! };
+        Assert.Throws<InvalidOperationException>(() => ControlCommandDispatcher.MapSnapshot(invalidMachine));
+
+        var invalidElements = DiagnosticSnapshot() with { Adapters = new AdapterState[] { null! } };
+        Assert.Throws<InvalidOperationException>(() => ControlCommandDispatcher.MapSnapshot(invalidElements));
+    }
+
+    [Fact]
     public async Task ConcurrentReplayReservationHasExactlyOneWinner()
     {
         var guard = new ControlRequestReplayGuard(new MutableTimeProvider(Now));
@@ -191,7 +268,7 @@ public sealed class ControlPipeSecurityTests
         var dispatcher = new FakeDispatcher();
         var handler = Handler(dispatcher);
         await handler.HandleAuthenticatedForTestsAsync(
-            new MemoryStream(new byte[3]),
+            new DuplexStream(new byte[3]),
             Caller("S-1-5-21-1"),
             CancellationToken.None);
         Assert.Equal(0, dispatcher.Calls);
@@ -307,7 +384,70 @@ public sealed class ControlPipeSecurityTests
     }
 
     [Fact]
-    public void SecureStackIsInactiveAndRecoveryRemainsUnreachable()
+    public async Task AuthorizedCallerReceivesGreetingBeforeRequestRead()
+    {
+        var stream = new DuplexStream(Array.Empty<byte>(), throwOnRead: true);
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            Handler(new FakeDispatcher()).HandleAuthenticatedForTestsAsync(
+                stream, Caller("S-1-5-21-1"), CancellationToken.None));
+        await using var output = new MemoryStream(stream.Written);
+        var greeting = await LengthPrefixedJsonProtocol.ReadGreetingAsync(output);
+        Assert.Equal(ControlProtocolConstants.Version, greeting.ProtocolVersion);
+        Assert.Equal(InstanceId, greeting.ServiceInstanceId);
+        Assert.Equal(output.Length, output.Position);
+    }
+
+    [Fact]
+    public async Task OversizedSnapshotFallsBackWithoutPartialFrameAndConsumesReplay()
+    {
+        var dispatcher = new FakeDispatcher
+        {
+            Result = new ControlSnapshotResult(new ControlNetworkSnapshot(
+                Now, new string('x', ControlProtocolConstants.MaximumResponseSize),
+                Array.Empty<ControlAdapterState>(), null, null))
+        };
+        var handler = Handler(dispatcher);
+        var request = Request() with { Command = ControlCommand.Snapshot };
+        var first = await InvokeAsync(handler, request, Caller("S-1-5-21-1"));
+        dispatcher.Result = new ControlStatusResult(ControlConnectionState.Disconnected);
+        var replay = await InvokeAsync(handler, request, Caller("S-1-5-21-1"));
+
+        Assert.Equal(ControlOutcome.Failed, first!.Outcome);
+        Assert.Equal(ControlErrorCode.ResponseTooLarge, first.ErrorCode);
+        Assert.Equal(request.Command, first.Command);
+        Assert.Null(first.Result);
+        Assert.Equal(ControlErrorCode.DuplicateRequest, replay!.ErrorCode);
+        Assert.Equal(1, dispatcher.Calls);
+    }
+
+    [Fact]
+    public async Task NonOversizeProtocolFailurePropagatesWithoutSecondResponseAndConsumesReplay()
+    {
+        var dispatcher = new FakeDispatcher
+        {
+            Result = new ControlStatusResult((ControlConnectionState)int.MaxValue)
+        };
+        var handler = Handler(dispatcher);
+        var request = Request();
+        await using var firstStream = await RequestStreamAsync(request);
+
+        var exception = await Assert.ThrowsAsync<ControlProtocolException>(() =>
+            handler.HandleAuthenticatedForTestsAsync(firstStream, Caller("S-1-5-21-1"), CancellationToken.None));
+        Assert.Equal(ControlProtocolError.InvalidContract, exception.Error);
+
+        await using var firstOutput = new MemoryStream(firstStream.Written);
+        var greeting = await LengthPrefixedJsonProtocol.ReadGreetingAsync(firstOutput);
+        Assert.Equal(InstanceId, greeting.ServiceInstanceId);
+        Assert.Equal(firstOutput.Length, firstOutput.Position);
+
+        dispatcher.Result = new ControlStatusResult(ControlConnectionState.Disconnected);
+        var replay = await InvokeAsync(handler, request, Caller("S-1-5-21-1"));
+        Assert.Equal(ControlErrorCode.DuplicateRequest, replay!.ErrorCode);
+        Assert.Equal(1, dispatcher.Calls);
+    }
+
+    [Fact]
+    public void SecureStackIsProductionV2OnlyAndRecoveryRemainsUnreachable()
     {
         var root = FindRepositoryRoot();
         var worker = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Service", "LibertyRouteWorker.cs"));
@@ -316,10 +456,15 @@ public sealed class ControlPipeSecurityTests
         var serviceProject = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Service", "LibertyRoute.Service.csproj"));
         var protocol = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.ControlProtocol", "ControlProtocolContracts.cs"));
 
-        Assert.Contains("ReadLineAsync", worker, StringComparison.Ordinal);
-        Assert.DoesNotContain("SecureControl", worker, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Network.v2", worker, StringComparison.Ordinal);
+        Assert.Contains("SecureControlPipeFactory", worker, StringComparison.Ordinal);
+        Assert.Contains("SecureControlConnectionHandler", worker, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.Network.v1", worker, StringComparison.Ordinal);
+        Assert.DoesNotContain("ReadLineAsync", worker, StringComparison.Ordinal);
+        Assert.DoesNotContain("WriteLineAsync", worker, StringComparison.Ordinal);
+        Assert.DoesNotContain("ToUpperInvariant", worker, StringComparison.Ordinal);
         Assert.DoesNotContain("SecureControl", program, StringComparison.Ordinal);
-        Assert.DoesNotContain("SecureControl", registration, StringComparison.Ordinal);
+        Assert.Contains("SecureControlConnectionHandler", registration, StringComparison.Ordinal);
         Assert.Contains("LibertyRoute.ControlProtocol", serviceProject, StringComparison.Ordinal);
         Assert.DoesNotContain("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
         Assert.DoesNotContain("Recovery", string.Join(',', Enum.GetNames<ControlCommand>()), StringComparison.OrdinalIgnoreCase);
@@ -403,20 +548,22 @@ public sealed class ControlPipeSecurityTests
         ControlCallerIdentity caller)
     {
         await using var stream = await RequestStreamAsync(request);
-        var responseStart = stream.Length;
         await handler.HandleAuthenticatedForTestsAsync(stream, caller, CancellationToken.None);
-        if (stream.Length == responseStart)
+        await using var output = new MemoryStream(stream.Written);
+        var greeting = await LengthPrefixedJsonProtocol.ReadGreetingAsync(output);
+        Assert.Equal(InstanceId, greeting.ServiceInstanceId);
+        if (output.Position == output.Length)
             return null;
-        stream.Position = responseStart;
-        return await LengthPrefixedJsonProtocol.ReadResponseAsync(stream);
+        var response = await LengthPrefixedJsonProtocol.ReadResponseAsync(output);
+        Assert.Equal(output.Length, output.Position);
+        return response;
     }
 
-    private static async Task<MemoryStream> RequestStreamAsync(ControlRequestEnvelope request)
+    private static async Task<DuplexStream> RequestStreamAsync(ControlRequestEnvelope request)
     {
-        var stream = new MemoryStream();
-        await LengthPrefixedJsonProtocol.WriteRequestAsync(stream, request);
-        stream.Position = 0;
-        return stream;
+        await using var input = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteRequestAsync(input, request);
+        return new DuplexStream(input.ToArray());
     }
 
     private static string FindRepositoryRoot()
@@ -426,6 +573,12 @@ public sealed class ControlPipeSecurityTests
             directory = directory.Parent;
         return directory?.FullName ?? throw new DirectoryNotFoundException("Repository root not found.");
     }
+
+    private static NetworkStateSnapshot DiagnosticSnapshot()
+        => new(Now, "machine",
+            new[] { new AdapterState("id", "name", "description", "Ethernet", "Up", new[] { "10.0.0.2" }, new[] { "10.0.0.1" }, new[] { "1.1.1.1" }) },
+            new[] { new RouteState { Destination = "0.0.0.0/0", NextHop = "10.0.0.1", InterfaceIndex = 7, Metric = uint.MaxValue, AddressFamily = "InterNetwork" } },
+            new[] { new DnsInterfaceState("id", "name", true, new[] { "1.1.1.1" }, null, Array.Empty<string>()) });
 
     private sealed class MutableTimeProvider(DateTimeOffset utcNow) : TimeProvider
     {
@@ -451,6 +604,52 @@ public sealed class ControlPipeSecurityTests
         }
     }
 
+    private sealed class FakeNetworkStateManager(NetworkStateSnapshot snapshot) : INetworkStateManager
+    {
+        public int Captures { get; private set; }
+        public int Verifications { get; private set; }
+        public Task<NetworkStateSnapshot> CaptureStateAsync(CancellationToken cancellationToken)
+        {
+            Captures++;
+            return Task.FromResult(snapshot);
+        }
+        public Task VerifyRestorationAsync(NetworkStateSnapshot original, CancellationToken cancellationToken)
+        {
+            Verifications++;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FakeTransactionJournal : ITransactionJournal
+    {
+        public NetworkTransaction? Active { get; private set; }
+        public int Writes { get; private set; }
+        public int Clears { get; private set; }
+        public string JournalPath => "controlled-test";
+        public Task WriteAsync(NetworkTransaction transaction, CancellationToken cancellationToken)
+        {
+            Writes++;
+            Active = transaction;
+            return Task.CompletedTask;
+        }
+        public Task<NetworkTransaction?> ReadActiveAsync(CancellationToken cancellationToken) => Task.FromResult(Active);
+        public Task ClearAsync(Guid expectedSessionId, CancellationToken cancellationToken)
+        {
+            Clears++;
+            Active = null;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FakeConnectionEngine : IConnectionEngine
+    {
+        public string Id => "controlled-test";
+        public int Stops { get; private set; }
+        public Task StartAsync(VpnServerConfig server, CancellationToken cancellationToken) => throw new InvalidOperationException("Start is forbidden in this test.");
+        public Task StopAsync(CancellationToken cancellationToken) { Stops++; return Task.CompletedTask; }
+        public Task<bool> IsHealthyAsync(CancellationToken cancellationToken) => Task.FromResult(false);
+    }
+
     private sealed class ThrowOnReadStream : Stream
     {
         public override bool CanRead => true;
@@ -465,5 +664,28 @@ public sealed class ControlPipeSecurityTests
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
             => throw new InvalidOperationException("Read was forbidden.");
+    }
+
+    private sealed class DuplexStream(byte[] input, bool throwOnRead = false) : Stream
+    {
+        private readonly MemoryStream _input = new(input, writable: false);
+        private readonly MemoryStream _output = new();
+        public byte[] Written => _output.ToArray();
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() => _output.Flush();
+        public override Task FlushAsync(CancellationToken cancellationToken) => _output.FlushAsync(cancellationToken);
+        public override int Read(byte[] buffer, int offset, int count)
+            => throwOnRead ? throw new InvalidOperationException("Read was forbidden.") : _input.Read(buffer, offset, count);
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+            => throwOnRead ? throw new InvalidOperationException("Read was forbidden.") : _input.ReadAsync(buffer, cancellationToken);
+        public override void Write(byte[] buffer, int offset, int count) => _output.Write(buffer, offset, count);
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+            => _output.WriteAsync(buffer, cancellationToken);
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
     }
 }

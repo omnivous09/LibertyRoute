@@ -302,15 +302,37 @@ public sealed class ServiceCompositionTests
     }
 
     [Fact]
-    public void WorkerCommandSurfaceRemainsUnchangedWithoutOwnershipCommands()
+    public void WorkerUsesOnlySecureV2CommandSurfaceWithoutOwnershipCommands()
     {
         var workerSource = ReadSource("src", "LibertyRoute.Service", "LibertyRouteWorker.cs");
 
-        foreach (var command in new[] { "\"STATUS\"", "\"SNAPSHOT\"", "\"CONNECT\"", "\"DISCONNECT\"" })
-            Assert.Contains(command, workerSource, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Network.v2", workerSource, StringComparison.Ordinal);
+        Assert.Contains("SecureControlConnectionHandler", workerSource, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.Network.v1", workerSource, StringComparison.Ordinal);
+        foreach (var legacy in new[] { "ReadLineAsync", "WriteLineAsync", "ToUpperInvariant", "JsonSerializer", "\"STATUS\"", "\"SNAPSHOT\"", "\"CONNECT\"", "\"DISCONNECT\"" })
+            Assert.DoesNotContain(legacy, workerSource, StringComparison.Ordinal);
 
         foreach (var forbiddenCommand in new[] { "OWNERSHIP", "LEDGER", "EVIDENCE", "EXECUTE", "RESTORE", "APPLY" })
             Assert.DoesNotContain($"\"{forbiddenCommand}\"", workerSource, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SecureControlProductionRegistrationsAreExactOnceSingletons()
+    {
+        var services = new ServiceCollection();
+        services.AddLibertyRouteCoreServices();
+        foreach (var type in new[]
+        {
+            typeof(TimeProvider), typeof(ControlServiceInstance), typeof(SecureControlPipeFactory),
+            typeof(ControlCommandAuthorization), typeof(ControlRequestReplayGuard),
+            typeof(IControlCommandDispatcher), typeof(SecureControlConnectionHandler)
+        })
+        {
+            var descriptor = Assert.Single(services, item => item.ServiceType == type);
+            Assert.Equal(ServiceLifetime.Singleton, descriptor.Lifetime);
+        }
+        Assert.Equal(typeof(ControlCommandDispatcher),
+            Assert.Single(services, item => item.ServiceType == typeof(IControlCommandDispatcher)).ImplementationType);
     }
 
     [Fact]

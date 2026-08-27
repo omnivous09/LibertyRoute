@@ -62,6 +62,11 @@ internal sealed class SecureControlConnectionHandler
             return;
         }
 
+        await LengthPrefixedJsonProtocol.WriteGreetingAsync(
+            stream,
+            new ControlServerGreeting(ControlProtocolConstants.Version, _serviceInstance.Id),
+            cancellationToken);
+
         ControlRequestEnvelope request;
         try
         {
@@ -138,7 +143,14 @@ internal sealed class SecureControlConnectionHandler
             result.Outcome,
             result.ErrorCode,
             result.Result);
-        await LengthPrefixedJsonProtocol.WriteResponseAsync(stream, response, cancellationToken);
+        try
+        {
+            await LengthPrefixedJsonProtocol.WriteResponseAsync(stream, response, cancellationToken);
+        }
+        catch (ControlProtocolException exception) when (exception.Error == ControlProtocolError.FrameTooLarge)
+        {
+            await WriteFailureAsync(stream, request, ControlErrorCode.ResponseTooLarge, cancellationToken);
+        }
     }
 
     private Task WriteFailureAsync(

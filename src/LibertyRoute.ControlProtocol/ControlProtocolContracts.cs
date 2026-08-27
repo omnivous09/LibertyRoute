@@ -100,8 +100,8 @@ public sealed record ControlNetworkSnapshot(
     [property: JsonRequired] DateTimeOffset CapturedAtUtc,
     [property: JsonRequired] string MachineName,
     [property: JsonRequired] IReadOnlyList<ControlAdapterState> Adapters,
-    [property: JsonRequired] IReadOnlyList<ControlRouteState> Routes,
-    [property: JsonRequired] IReadOnlyList<ControlDnsInterfaceState> DnsInterfaces);
+    [property: JsonRequired] IReadOnlyList<ControlRouteState>? Routes,
+    [property: JsonRequired] IReadOnlyList<ControlDnsInterfaceState>? DnsInterfaces);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record ControlAdapterState(
@@ -113,20 +113,20 @@ public sealed record ControlAdapterState(
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record ControlRouteState(
     [property: JsonRequired] string Destination, [property: JsonRequired] string NextHop,
-    [property: JsonRequired] int InterfaceIndex, [property: JsonRequired] int Metric,
+    [property: JsonRequired] int InterfaceIndex, [property: JsonRequired] uint Metric,
     [property: JsonRequired] string AddressFamily);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record ControlDnsInterfaceState(
     [property: JsonRequired] string InterfaceId, [property: JsonRequired] string InterfaceName,
     [property: JsonRequired] bool IsUp, [property: JsonRequired] IReadOnlyList<string> DnsServers,
-    [property: JsonRequired] IReadOnlyList<string> IPv4DnsServers, [property: JsonRequired] IReadOnlyList<string> IPv6DnsServers,
+    [property: JsonRequired] IReadOnlyList<string>? IPv4DnsServers, [property: JsonRequired] IReadOnlyList<string>? IPv6DnsServers,
     [property: JsonRequired] ControlDnsConfigurationSource IPv4ConfigurationSource,
     [property: JsonRequired] ControlDnsConfigurationSource IPv6ConfigurationSource,
-    [property: JsonRequired] IReadOnlyList<string> IPv4StaticDnsServers,
-    [property: JsonRequired] IReadOnlyList<string> IPv4DhcpDnsServers,
-    [property: JsonRequired] IReadOnlyList<string> IPv6StaticDnsServers,
-    [property: JsonRequired] IReadOnlyList<string> IPv6DhcpDnsServers);
+    [property: JsonRequired] IReadOnlyList<string>? IPv4StaticDnsServers,
+    [property: JsonRequired] IReadOnlyList<string>? IPv4DhcpDnsServers,
+    [property: JsonRequired] IReadOnlyList<string>? IPv6StaticDnsServers,
+    [property: JsonRequired] IReadOnlyList<string>? IPv6DhcpDnsServers);
 
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record ControlResponseEnvelope(

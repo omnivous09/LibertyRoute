@@ -116,8 +116,8 @@ public sealed class ControlProtocolSecurityTests
                 Assert.Equal(snapshot.CapturedAtUtc, actualSnapshot.Snapshot.CapturedAtUtc);
                 Assert.Equal(snapshot.MachineName, actualSnapshot.Snapshot.MachineName);
                 Assert.Empty(actualSnapshot.Snapshot.Adapters);
-                Assert.Empty(actualSnapshot.Snapshot.Routes);
-                Assert.Empty(actualSnapshot.Snapshot.DnsInterfaces);
+                Assert.Empty(Assert.IsAssignableFrom<IReadOnlyList<ControlRouteState>>(actualSnapshot.Snapshot.Routes));
+                Assert.Empty(Assert.IsAssignableFrom<IReadOnlyList<ControlDnsInterfaceState>>(actualSnapshot.Snapshot.DnsInterfaces));
             }
             else
             {
@@ -137,6 +137,81 @@ public sealed class ControlProtocolSecurityTests
         Assert.InRange(stream.Length, 1, ControlProtocolConstants.MaximumResponseSize + ControlProtocolConstants.LengthPrefixSize);
         await Assert.ThrowsAsync<ControlProtocolException>(() => LengthPrefixedJsonProtocol.WriteResponseAsync(
             new MemoryStream(), failure with { Result = new ControlSnapshotResult(EmptySnapshot("machine")) }));
+    }
+
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(2147483647u)]
+    [InlineData(2147483648u)]
+    [InlineData(uint.MaxValue)]
+    public async Task RouteMetricPreservesFullUnsignedRange(uint metric)
+    {
+        var snapshot = EmptySnapshot("machine") with
+        {
+            Routes = new[] { new ControlRouteState("destination", "next-hop", 7, metric, "family") }
+        };
+        var actual = await RoundTripSnapshotAsync(snapshot);
+        Assert.Equal(metric, Assert.Single(actual.Routes!).Metric);
+    }
+
+    [Theory]
+    [InlineData("-1")]
+    [InlineData("\"7\"")]
+    public async Task NegativeOrWrongTypeRouteMetricJsonIsRejected(string replacement)
+    {
+        var snapshot = EmptySnapshot("machine") with
+        {
+            Routes = new[] { new ControlRouteState("destination", "next-hop", 7, 1, "family") }
+        };
+        var json = (await ResponseJsonAsync(Response(new ControlSnapshotResult(snapshot), ControlCommand.Snapshot)))
+            .ReplacePropertyValue("metric", replacement);
+        Assert.Equal(ControlProtocolError.MalformedJson, (await ReadResponseFailureAsync(json)).Error);
+    }
+
+    [Fact]
+    public async Task NullableSnapshotAndDnsCollectionsPreserveNullVersusEmpty()
+    {
+        var nullDns = new ControlDnsInterfaceState("id", "name", true, Array.Empty<string>(),
+            null, null, ControlDnsConfigurationSource.Unknown, ControlDnsConfigurationSource.Unknown,
+            null, null, null, null);
+        var emptyDns = new ControlDnsInterfaceState("id", "name", true, Array.Empty<string>(),
+            Array.Empty<string>(), Array.Empty<string>(), ControlDnsConfigurationSource.Unknown, ControlDnsConfigurationSource.Unknown,
+            Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>());
+
+        var nullSnapshot = await RoundTripSnapshotAsync(new ControlNetworkSnapshot(
+            DateTimeOffset.Parse("2026-01-02T03:04:05+00:00"), "machine", Array.Empty<ControlAdapterState>(), null, null));
+        Assert.Null(nullSnapshot.Routes);
+        Assert.Null(nullSnapshot.DnsInterfaces);
+
+        var emptySnapshot = await RoundTripSnapshotAsync(new ControlNetworkSnapshot(
+            DateTimeOffset.Parse("2026-01-02T03:04:05+00:00"), "machine", Array.Empty<ControlAdapterState>(),
+            Array.Empty<ControlRouteState>(), new[] { nullDns, emptyDns }));
+        Assert.Empty(emptySnapshot.Routes!);
+        var dns = emptySnapshot.DnsInterfaces!;
+        Assert.All(new[] { dns[0].IPv4DnsServers, dns[0].IPv6DnsServers, dns[0].IPv4StaticDnsServers,
+            dns[0].IPv4DhcpDnsServers, dns[0].IPv6StaticDnsServers, dns[0].IPv6DhcpDnsServers }, Assert.Null);
+        Assert.All(new[] { dns[1].IPv4DnsServers, dns[1].IPv6DnsServers, dns[1].IPv4StaticDnsServers,
+            dns[1].IPv4DhcpDnsServers, dns[1].IPv6StaticDnsServers, dns[1].IPv6DhcpDnsServers }, value => Assert.Empty(value!));
+    }
+
+    [Theory]
+    [InlineData("routes")]
+    [InlineData("dnsInterfaces")]
+    [InlineData("iPv4DnsServers")]
+    [InlineData("iPv6DnsServers")]
+    [InlineData("iPv4StaticDnsServers")]
+    [InlineData("iPv4DhcpDnsServers")]
+    [InlineData("iPv6StaticDnsServers")]
+    [InlineData("iPv6DhcpDnsServers")]
+    public async Task NullableCollectionsRemainRequiredAndRejectWrongJsonTypes(string property)
+    {
+        var dns = new ControlDnsInterfaceState("id", "name", true, Array.Empty<string>(),
+            Array.Empty<string>(), Array.Empty<string>(), ControlDnsConfigurationSource.Unknown, ControlDnsConfigurationSource.Unknown,
+            Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>());
+        var snapshot = EmptySnapshot("machine") with { DnsInterfaces = new[] { dns } };
+        var json = await ResponseJsonAsync(Response(new ControlSnapshotResult(snapshot), ControlCommand.Snapshot));
+        Assert.Equal(ControlProtocolError.MalformedJson, (await ReadResponseFailureAsync(RemoveProperty(json, property))).Error);
+        Assert.Equal(ControlProtocolError.MalformedJson, (await ReadResponseFailureAsync(json.ReplacePropertyValue(property, "{}"))).Error);
     }
 
     [Theory]
@@ -322,7 +397,7 @@ public sealed class ControlProtocolSecurityTests
     }
 
     [Fact]
-    public void ProtocolProjectIsAPlatformNeutralDependencyLeafAndProductionIpcIsUnchanged()
+    public void ProtocolProjectIsAPlatformNeutralDependencyLeafAndProductionServiceIsV2Only()
     {
         var root = FindRepositoryRoot();
         var projectDirectory = Path.Combine(root, "src", "LibertyRoute.ControlProtocol");
@@ -340,11 +415,14 @@ public sealed class ControlProtocolSecurityTests
         Assert.Contains("LibertyRoute.ControlProtocol", serviceProject, StringComparison.Ordinal);
         Assert.DoesNotContain("LibertyRoute.ControlProtocol", desktopProject, StringComparison.Ordinal);
         Assert.DoesNotContain("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
-        Assert.Contains("ReadLineAsync", worker, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Network.v2", worker, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.Network.v1", worker, StringComparison.Ordinal);
+        Assert.DoesNotContain("ReadLineAsync", worker, StringComparison.Ordinal);
+        Assert.DoesNotContain("WriteLineAsync", worker, StringComparison.Ordinal);
         Assert.Contains("WriteLineAsync(command)", desktop, StringComparison.Ordinal);
-        Assert.DoesNotContain("SecureControl", worker, StringComparison.Ordinal);
+        Assert.Contains("SecureControlConnectionHandler", worker, StringComparison.Ordinal);
         Assert.DoesNotContain("SecureControl", program, StringComparison.Ordinal);
-        Assert.DoesNotContain("SecureControl", registration, StringComparison.Ordinal);
+        Assert.Contains("SecureControlConnectionHandler", registration, StringComparison.Ordinal);
         Assert.DoesNotContain("Recovery", string.Join(',', Enum.GetNames<ControlCommand>()), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Restoration", string.Join(',', Enum.GetNames<ControlCommand>()), StringComparison.OrdinalIgnoreCase);
 
@@ -377,6 +455,27 @@ public sealed class ControlProtocolSecurityTests
 
     private static Task<ControlRequestEnvelope> ReadRequestAsync(string json)
         => LengthPrefixedJsonProtocol.ReadRequestAsync(Frame(json));
+
+    private static Task<ControlResponseEnvelope> ReadResponseAsync(string json)
+        => LengthPrefixedJsonProtocol.ReadResponseAsync(Frame(json));
+
+    private static async Task<ControlProtocolException> ReadResponseFailureAsync(string json)
+        => await Assert.ThrowsAsync<ControlProtocolException>(() => ReadResponseAsync(json));
+
+    private static async Task<string> ResponseJsonAsync(ControlResponseEnvelope response)
+    {
+        await using var stream = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteResponseAsync(stream, response);
+        return Encoding.UTF8.GetString(stream.ToArray()[ControlProtocolConstants.LengthPrefixSize..]);
+    }
+
+    private static async Task<ControlNetworkSnapshot> RoundTripSnapshotAsync(ControlNetworkSnapshot snapshot)
+    {
+        await using var stream = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteResponseAsync(stream, Response(new ControlSnapshotResult(snapshot), ControlCommand.Snapshot));
+        stream.Position = 0;
+        return Assert.IsType<ControlSnapshotResult>((await LengthPrefixedJsonProtocol.ReadResponseAsync(stream)).Result).Snapshot;
+    }
 
     private static MemoryStream Frame(string json)
     {

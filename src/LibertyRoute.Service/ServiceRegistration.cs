@@ -65,6 +65,13 @@ public static class LibertyRouteRegistration
         services.AddSingleton<IConnectionEngine, WireGuardEngine>();
         services.AddSingleton<ConnectionController>();
         services.AddSingleton<IRecordedMutationExecutorFactory, RecordedMutationExecutorFactory>();
+        services.AddSingleton<TimeProvider>(TimeProvider.System);
+        services.AddSingleton(_ => ControlServiceInstance.CreateTransient());
+        services.AddSingleton(_ => SecureControlPipeFactory.ForCurrentProcess());
+        services.AddSingleton(_ => new ControlCommandAuthorization());
+        services.AddSingleton(provider => new ControlRequestReplayGuard(provider.GetRequiredService<TimeProvider>()));
+        services.AddSingleton<IControlCommandDispatcher, ControlCommandDispatcher>();
+        services.AddSingleton<SecureControlConnectionHandler>();
         services.AddHostedService<LibertyRouteWorker>();
     }
 }

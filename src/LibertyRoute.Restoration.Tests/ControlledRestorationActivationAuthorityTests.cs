@@ -635,10 +635,24 @@ public sealed class ControlledRestorationActivationAuthorityTests
         Assert.Equal(new[] { typeof(ITransactionJournal) }, recoveryConstructor.GetParameters().Select(parameter => parameter.ParameterType));
 
         var worker = ReadSource("src", "LibertyRoute.Service", "LibertyRouteWorker.cs");
-        foreach (var command in new[] { "\"STATUS\"", "\"SNAPSHOT\"", "\"CONNECT\"", "\"DISCONNECT\"" })
-            Assert.Contains(command, worker, StringComparison.Ordinal);
+        var serviceProject = ReadSource("src", "LibertyRoute.Service", "LibertyRoute.Service.csproj");
+        Assert.Contains("RecoverOnStartupAsync", worker, StringComparison.Ordinal);
+        Assert.Contains("RollbackAsync", worker, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Network.v2", worker, StringComparison.Ordinal);
+        Assert.Contains("SecureControlPipeFactory", worker, StringComparison.Ordinal);
+        Assert.Contains("SecureControlConnectionHandler", worker, StringComparison.Ordinal);
+        foreach (var legacy in new[] { "ReadLineAsync", "WriteLineAsync", "ToUpperInvariant", "JsonSerializer", "ex.Message", "\"STATUS\"", "\"SNAPSHOT\"", "\"CONNECT\"", "\"DISCONNECT\"" })
+            Assert.DoesNotContain(legacy, worker, StringComparison.Ordinal);
         foreach (var command in new[] { "RESTORE", "APPLY", "EXECUTE", "ACTIVATE", "AUTHORITY" })
             Assert.DoesNotContain($"\"{command}\"", worker, StringComparison.Ordinal);
+        foreach (var activationType in new[]
+        {
+            "ControlledRecoveryApproval", "ControlledApprovedRecoveryExecution",
+            "ControlledRecoveryRestorationWorkflow", "ControlledRestorationActivationGrant",
+            "RestorationExecutionCapability", "ControlledRestorationActivationHandoff"
+        })
+            Assert.DoesNotContain(activationType, worker, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
     }
 
     private static string RepoRoot()
