@@ -409,17 +409,39 @@ public sealed class ControlProtocolSecurityTests
         var program = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Service", "Program.cs"));
         var registration = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Service", "ServiceRegistration.cs"));
         var desktop = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Desktop", "MainWindow.xaml.cs"));
+        var controlClient = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Desktop", "ControlClient.cs"));
+        var snapshotExporter = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Desktop", "ControlSnapshotExporter.cs"));
 
         Assert.Contains("<TargetFramework>net10.0</TargetFramework>", project, StringComparison.Ordinal);
         Assert.DoesNotContain("ProjectReference", project, StringComparison.Ordinal);
         Assert.Contains("LibertyRoute.ControlProtocol", serviceProject, StringComparison.Ordinal);
-        Assert.DoesNotContain("LibertyRoute.ControlProtocol", desktopProject, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.ControlProtocol", desktopProject, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.Service", desktopProject, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", desktopProject, StringComparison.Ordinal);
         Assert.DoesNotContain("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
         Assert.Contains("LibertyRoute.Network.v2", worker, StringComparison.Ordinal);
         Assert.DoesNotContain("LibertyRoute.Network.v1", worker, StringComparison.Ordinal);
         Assert.DoesNotContain("ReadLineAsync", worker, StringComparison.Ordinal);
         Assert.DoesNotContain("WriteLineAsync", worker, StringComparison.Ordinal);
-        Assert.Contains("WriteLineAsync(command)", desktop, StringComparison.Ordinal);
+        foreach (var legacy in new[]
+        {
+            "LibertyRoute.Network.v1", "NamedPipeClientStream", "StreamReader", "StreamWriter",
+            "ReadLineAsync", "WriteLineAsync", "JsonSerializer", "JsonDocument", "JsonElement",
+            "SendCommandAsync", "\"STATUS\"", "\"SNAPSHOT\"", "\"DISCONNECT\""
+        })
+            Assert.DoesNotContain(legacy, desktop, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Network.v2", controlClient, StringComparison.Ordinal);
+        Assert.Contains("ReadGreetingAsync", controlClient, StringComparison.Ordinal);
+        Assert.Contains("WriteRequestAsync", controlClient, StringComparison.Ordinal);
+        Assert.Contains("ReadResponseAsync", controlClient, StringComparison.Ordinal);
+        Assert.Contains("VPN transport is not enabled", desktop, StringComparison.Ordinal);
+        Assert.Contains("DefaultIgnoreCondition = JsonIgnoreCondition.Never", snapshotExporter, StringComparison.Ordinal);
+        foreach (var exporterForbidden in new[]
+        {
+            "ControlRequestEnvelope", "ControlResponseEnvelope", "ControlServerGreeting",
+            "LengthPrefixedJsonProtocol", "NamedPipeClientStream", "Deserialize", "?? Array.Empty"
+        })
+            Assert.DoesNotContain(exporterForbidden, snapshotExporter, StringComparison.Ordinal);
         Assert.Contains("SecureControlConnectionHandler", worker, StringComparison.Ordinal);
         Assert.DoesNotContain("SecureControl", program, StringComparison.Ordinal);
         Assert.Contains("SecureControlConnectionHandler", registration, StringComparison.Ordinal);

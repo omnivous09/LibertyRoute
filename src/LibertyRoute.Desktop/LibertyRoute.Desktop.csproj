@@ -6,4 +6,7 @@
     <OutputType>WinExe</OutputType>
     <UseWPF>true</UseWPF>
   </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LibertyRoute.ControlProtocol\LibertyRoute.ControlProtocol.csproj" />
+  </ItemGroup>
 </Project>
