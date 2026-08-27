@@ -30,6 +30,12 @@ public enum ControlErrorCode
     InvalidRequest,
     UnsupportedVersion,
     Unauthorized,
+    ForbiddenCommand,
+    WrongServiceInstance,
+    StaleRequest,
+    DuplicateRequest,
+    RequestConflict,
+    ReplayCapacityExceeded,
     InternalError
 }
 

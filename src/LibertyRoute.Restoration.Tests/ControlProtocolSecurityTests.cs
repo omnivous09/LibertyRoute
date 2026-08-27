@@ -242,14 +242,22 @@ public sealed class ControlProtocolSecurityTests
         var serviceProject = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Service", "LibertyRoute.Service.csproj"));
         var desktopProject = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Desktop", "LibertyRoute.Desktop.csproj"));
         var worker = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Service", "LibertyRouteWorker.cs"));
+        var program = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Service", "Program.cs"));
+        var registration = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Service", "ServiceRegistration.cs"));
         var desktop = File.ReadAllText(Path.Combine(root, "src", "LibertyRoute.Desktop", "MainWindow.xaml.cs"));
 
         Assert.Contains("<TargetFramework>net10.0</TargetFramework>", project, StringComparison.Ordinal);
         Assert.DoesNotContain("ProjectReference", project, StringComparison.Ordinal);
-        Assert.DoesNotContain("LibertyRoute.ControlProtocol", serviceProject, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.ControlProtocol", serviceProject, StringComparison.Ordinal);
         Assert.DoesNotContain("LibertyRoute.ControlProtocol", desktopProject, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
         Assert.Contains("ReadLineAsync", worker, StringComparison.Ordinal);
         Assert.Contains("WriteLineAsync(command)", desktop, StringComparison.Ordinal);
+        Assert.DoesNotContain("SecureControl", worker, StringComparison.Ordinal);
+        Assert.DoesNotContain("SecureControl", program, StringComparison.Ordinal);
+        Assert.DoesNotContain("SecureControl", registration, StringComparison.Ordinal);
+        Assert.DoesNotContain("Recovery", string.Join(',', Enum.GetNames<ControlCommand>()), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Restoration", string.Join(',', Enum.GetNames<ControlCommand>()), StringComparison.OrdinalIgnoreCase);
 
         var privilegedTypeTerms = new[]
         {
