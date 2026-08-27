@@ -4,8 +4,9 @@ namespace LibertyRoute.ControlProtocol;
 
 public static class ControlProtocolConstants
 {
-    public const int Version = 1;
+    public const int Version = 2;
     public const int LengthPrefixSize = 4;
+    public const int MaximumGreetingSize = 1024;
     public const int MaximumRequestSize = 16 * 1024;
     public const int MaximumResponseSize = 1024 * 1024;
 }
@@ -24,6 +25,14 @@ public enum ControlOutcome
     Failed
 }
 
+public enum ControlConnectionState
+{
+    Disconnected, CapturingState, SnapshotCommitted, Connecting, Connected,
+    RollbackRequired, RollingBack, Verifying, RestorationFailed
+}
+
+public enum ControlDnsConfigurationSource { Unknown, Automatic, Static, Mixed }
+
 public enum ControlErrorCode
 {
     None,
@@ -36,8 +45,14 @@ public enum ControlErrorCode
     DuplicateRequest,
     RequestConflict,
     ReplayCapacityExceeded,
+    ResponseTooLarge,
     InternalError
 }
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ControlServerGreeting(
+    [property: JsonRequired] int ProtocolVersion,
+    [property: JsonRequired] Guid ServiceInstanceId);
 
 public enum ControlProtocolError
 {
@@ -64,16 +79,64 @@ public sealed record ControlRequestEnvelope(
     [property: JsonRequired] ControlCommand Command,
     [property: JsonRequired] ControlRequestPayload Payload);
 
+[JsonPolymorphic(TypeDiscriminatorPropertyName = "$resultType")]
+[JsonDerivedType(typeof(ControlStatusResult), "STATUS")]
+[JsonDerivedType(typeof(ControlSnapshotResult), "SNAPSHOT")]
+[JsonDerivedType(typeof(ControlConnectResult), "CONNECT")]
+[JsonDerivedType(typeof(ControlDisconnectResult), "DISCONNECT")]
+public abstract record ControlResponseResult;
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ControlStatusResult([property: JsonRequired] ControlConnectionState State) : ControlResponseResult;
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ControlSnapshotResult([property: JsonRequired] ControlNetworkSnapshot Snapshot) : ControlResponseResult;
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ControlConnectResult([property: JsonRequired] ControlConnectionState State) : ControlResponseResult;
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ControlDisconnectResult([property: JsonRequired] ControlConnectionState State) : ControlResponseResult;
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ControlNetworkSnapshot(
+    [property: JsonRequired] DateTimeOffset CapturedAtUtc,
+    [property: JsonRequired] string MachineName,
+    [property: JsonRequired] IReadOnlyList<ControlAdapterState> Adapters,
+    [property: JsonRequired] IReadOnlyList<ControlRouteState> Routes,
+    [property: JsonRequired] IReadOnlyList<ControlDnsInterfaceState> DnsInterfaces);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ControlAdapterState(
+    [property: JsonRequired] string Id, [property: JsonRequired] string Name,
+    [property: JsonRequired] string Description, [property: JsonRequired] string NetworkInterfaceType,
+    [property: JsonRequired] string OperationalStatus, [property: JsonRequired] IReadOnlyList<string> UnicastAddresses,
+    [property: JsonRequired] IReadOnlyList<string> Gateways, [property: JsonRequired] IReadOnlyList<string> DnsServers);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ControlRouteState(
+    [property: JsonRequired] string Destination, [property: JsonRequired] string NextHop,
+    [property: JsonRequired] int InterfaceIndex, [property: JsonRequired] int Metric,
+    [property: JsonRequired] string AddressFamily);
+
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record ControlDnsInterfaceState(
+    [property: JsonRequired] string InterfaceId, [property: JsonRequired] string InterfaceName,
+    [property: JsonRequired] bool IsUp, [property: JsonRequired] IReadOnlyList<string> DnsServers,
+    [property: JsonRequired] IReadOnlyList<string> IPv4DnsServers, [property: JsonRequired] IReadOnlyList<string> IPv6DnsServers,
+    [property: JsonRequired] ControlDnsConfigurationSource IPv4ConfigurationSource,
+    [property: JsonRequired] ControlDnsConfigurationSource IPv6ConfigurationSource,
+    [property: JsonRequired] IReadOnlyList<string> IPv4StaticDnsServers,
+    [property: JsonRequired] IReadOnlyList<string> IPv4DhcpDnsServers,
+    [property: JsonRequired] IReadOnlyList<string> IPv6StaticDnsServers,
+    [property: JsonRequired] IReadOnlyList<string> IPv6DhcpDnsServers);
+
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
 public sealed record ControlResponseEnvelope(
     [property: JsonRequired] int ProtocolVersion,
     [property: JsonRequired] Guid ServiceInstanceId,
     [property: JsonRequired] Guid RequestId,
+    [property: JsonRequired] ControlCommand Command,
     [property: JsonRequired] ControlOutcome Outcome,
     [property: JsonRequired] ControlErrorCode ErrorCode,
-    // Transitional, bounded response data for 4K-1. Phase 4K-3 must replace this
-    // with command-specific result contracts when production IPC is migrated.
-    [property: JsonRequired] string? Result);
+    [property: JsonRequired] ControlResponseResult? Result);
 
 public sealed class ControlProtocolException : Exception
 {

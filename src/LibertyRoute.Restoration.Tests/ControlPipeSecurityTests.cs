@@ -275,6 +275,21 @@ public sealed class ControlPipeSecurityTests
     }
 
     [Fact]
+    public async Task DispatcherResultForWrongCommandIsSanitized()
+    {
+        var dispatcher = new FakeDispatcher
+        {
+            Result = new ControlSnapshotResult(new ControlNetworkSnapshot(
+                Now, "machine", Array.Empty<ControlAdapterState>(), Array.Empty<ControlRouteState>(),
+                Array.Empty<ControlDnsInterfaceState>()))
+        };
+        var response = await InvokeAsync(Handler(dispatcher), Request(), Caller("S-1-5-21-1"));
+        Assert.Equal(ControlOutcome.Failed, response!.Outcome);
+        Assert.Equal(ControlErrorCode.InternalError, response.ErrorCode);
+        Assert.Null(response.Result);
+    }
+
+    [Fact]
     public async Task DispatcherCancellationPropagatesAndReservationRemainsConsumed()
     {
         var dispatcher = new FakeDispatcher { Exception = new OperationCanceledException() };
@@ -422,6 +437,7 @@ public sealed class ControlPipeSecurityTests
     {
         public int Calls { get; private set; }
         public Exception? Exception { get; set; }
+        public ControlResponseResult Result { get; set; } = new ControlStatusResult(ControlConnectionState.Disconnected);
 
         public Task<ControlDispatchResult> DispatchAsync(
             ControlCallerIdentity caller,
@@ -431,7 +447,7 @@ public sealed class ControlPipeSecurityTests
             Calls++;
             if (Exception is not null)
                 throw Exception;
-            return Task.FromResult(new ControlDispatchResult(ControlOutcome.Succeeded, ControlErrorCode.None, "ok"));
+            return Task.FromResult(new ControlDispatchResult(ControlOutcome.Succeeded, ControlErrorCode.None, Result));
         }
     }
 

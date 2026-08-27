@@ -6,7 +6,7 @@ namespace LibertyRoute.Service;
 internal sealed record ControlDispatchResult(
     ControlOutcome Outcome,
     ControlErrorCode ErrorCode,
-    string? Result);
+    ControlResponseResult? Result);
 
 internal interface IControlCommandDispatcher
 {
@@ -111,7 +111,8 @@ internal sealed class SecureControlConnectionHandler
         {
             result = await _dispatcher.DispatchAsync(caller, request, cancellationToken);
             if (!Enum.IsDefined(result.Outcome) || !Enum.IsDefined(result.ErrorCode) ||
-                ((result.Outcome == ControlOutcome.Succeeded) != (result.ErrorCode == ControlErrorCode.None)))
+                ((result.Outcome == ControlOutcome.Succeeded) != (result.ErrorCode == ControlErrorCode.None)) ||
+                !IsValidResult(request.Command, result))
                 result = new(ControlOutcome.Failed, ControlErrorCode.InternalError, null);
         }
         catch (OperationCanceledException)
@@ -133,6 +134,7 @@ internal sealed class SecureControlConnectionHandler
             ControlProtocolConstants.Version,
             _serviceInstance.Id,
             request.RequestId,
+            request.Command,
             result.Outcome,
             result.ErrorCode,
             result.Result);
@@ -150,8 +152,23 @@ internal sealed class SecureControlConnectionHandler
                 ControlProtocolConstants.Version,
                 _serviceInstance.Id,
                 request.RequestId,
+                request.Command,
                 ControlOutcome.Failed,
                 error,
                 null),
             cancellationToken);
+
+    private static bool IsValidResult(ControlCommand command, ControlDispatchResult result)
+    {
+        if (result.Outcome == ControlOutcome.Failed)
+            return result.Result is null;
+        return command switch
+        {
+            ControlCommand.Status => result.Result is ControlStatusResult,
+            ControlCommand.Snapshot => result.Result is ControlSnapshotResult,
+            ControlCommand.Connect => result.Result is ControlConnectResult,
+            ControlCommand.Disconnect => result.Result is ControlDisconnectResult,
+            _ => false
+        };
+    }
 }

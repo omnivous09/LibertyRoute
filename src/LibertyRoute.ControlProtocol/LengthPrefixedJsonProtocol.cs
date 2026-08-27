@@ -10,6 +10,9 @@ public static class LengthPrefixedJsonProtocol
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly JsonSerializerOptions JsonOptions = CreateJsonOptions();
 
+    public static Task<ControlServerGreeting> ReadGreetingAsync(Stream stream, CancellationToken cancellationToken = default)
+        => ReadAsync<ControlServerGreeting>(stream, ControlProtocolConstants.MaximumGreetingSize, ValidateGreeting, cancellationToken);
+
     public static Task<ControlRequestEnvelope> ReadRequestAsync(
         Stream stream,
         CancellationToken cancellationToken = default)
@@ -38,6 +41,9 @@ public static class LengthPrefixedJsonProtocol
             ControlProtocolConstants.MaximumRequestSize,
             ValidateRequest,
             cancellationToken);
+
+    public static Task WriteGreetingAsync(Stream stream, ControlServerGreeting greeting, CancellationToken cancellationToken = default)
+        => WriteAsync(stream, greeting, ControlProtocolConstants.MaximumGreetingSize, ValidateGreeting, cancellationToken);
 
     public static Task WriteResponseAsync(
         Stream stream,
@@ -156,12 +162,38 @@ public static class LengthPrefixedJsonProtocol
             throw new ControlProtocolException(ControlProtocolError.UnknownCommand);
     }
 
+    private static void ValidateGreeting(ControlServerGreeting greeting)
+    {
+        if (greeting.ProtocolVersion != ControlProtocolConstants.Version)
+            throw new ControlProtocolException(ControlProtocolError.UnsupportedVersion);
+        if (greeting.ServiceInstanceId == Guid.Empty)
+            throw new ControlProtocolException(ControlProtocolError.InvalidContract);
+    }
+
     private static void ValidateResponse(ControlResponseEnvelope response)
     {
         ValidateCommon(response.ProtocolVersion, response.ServiceInstanceId, response.RequestId);
+        if (!Enum.IsDefined(response.Command))
+            throw new ControlProtocolException(ControlProtocolError.UnknownCommand);
         if (!Enum.IsDefined(response.Outcome) || !Enum.IsDefined(response.ErrorCode))
             throw new ControlProtocolException(ControlProtocolError.InvalidContract);
         if ((response.Outcome == ControlOutcome.Succeeded) != (response.ErrorCode == ControlErrorCode.None))
+            throw new ControlProtocolException(ControlProtocolError.InvalidContract);
+        if (response.Outcome == ControlOutcome.Failed)
+        {
+            if (response.Result is not null)
+                throw new ControlProtocolException(ControlProtocolError.InvalidContract);
+            return;
+        }
+        var matches = response.Command switch
+        {
+            ControlCommand.Status => response.Result is ControlStatusResult,
+            ControlCommand.Snapshot => response.Result is ControlSnapshotResult,
+            ControlCommand.Connect => response.Result is ControlConnectResult,
+            ControlCommand.Disconnect => response.Result is ControlDisconnectResult,
+            _ => false
+        };
+        if (!matches)
             throw new ControlProtocolException(ControlProtocolError.InvalidContract);
     }
 
@@ -186,11 +218,15 @@ public static class LengthPrefixedJsonProtocol
             PropertyNameCaseInsensitive = false,
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             ReadCommentHandling = JsonCommentHandling.Disallow,
+            RespectNullableAnnotations = true,
+            RespectRequiredConstructorParameters = true,
             UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
         };
         options.Converters.Add(new ExactEnumConverter<ControlCommand>());
         options.Converters.Add(new ExactEnumConverter<ControlOutcome>());
         options.Converters.Add(new ExactEnumConverter<ControlErrorCode>());
+        options.Converters.Add(new ExactEnumConverter<ControlConnectionState>());
+        options.Converters.Add(new ExactEnumConverter<ControlDnsConfigurationSource>());
         return options;
     }
 

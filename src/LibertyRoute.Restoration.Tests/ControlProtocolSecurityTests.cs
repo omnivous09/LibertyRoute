@@ -14,13 +14,18 @@ public sealed class ControlProtocolSecurityTests
         command,
         new ControlRequestPayload());
 
-    private static ControlResponseEnvelope Response(string? result = "bounded-result") => new(
+    private static ControlResponseEnvelope Response(
+        ControlResponseResult? result = null,
+        ControlCommand command = ControlCommand.Status,
+        ControlOutcome outcome = ControlOutcome.Succeeded,
+        ControlErrorCode error = ControlErrorCode.None) => new(
         ControlProtocolConstants.Version,
         Guid.NewGuid(),
         Guid.NewGuid(),
-        ControlOutcome.Succeeded,
-        ControlErrorCode.None,
-        result);
+        command,
+        outcome,
+        error,
+        result ?? (outcome == ControlOutcome.Succeeded ? new ControlStatusResult(ControlConnectionState.Disconnected) : null));
 
     [Fact]
     public async Task ValidRequestRoundTrips()
@@ -35,9 +40,9 @@ public sealed class ControlProtocolSecurityTests
     }
 
     [Fact]
-    public async Task ValidResponseRoundTripsWithTransitionalBoundedResult()
+    public async Task ValidTypedResponseRoundTrips()
     {
-        var expected = Response("opaque diagnostic text");
+        var expected = Response(new ControlStatusResult(ControlConnectionState.Connected));
         await using var stream = new MemoryStream();
 
         await LengthPrefixedJsonProtocol.WriteResponseAsync(stream, expected);
@@ -63,10 +68,75 @@ public sealed class ControlProtocolSecurityTests
     [Fact]
     public async Task UnsupportedVersionIsRejected()
     {
-        var request = Request() with { ProtocolVersion = 2 };
+        var request = Request() with { ProtocolVersion = 1 };
         var exception = await Assert.ThrowsAsync<ControlProtocolException>(
             () => LengthPrefixedJsonProtocol.WriteRequestAsync(new MemoryStream(), request));
         Assert.Equal(ControlProtocolError.UnsupportedVersion, exception.Error);
+    }
+
+    [Fact]
+    public async Task GreetingRoundTripsAndRejectsVersionOneOrEmptyInstance()
+    {
+        var expected = new ControlServerGreeting(ControlProtocolConstants.Version, Guid.NewGuid());
+        await using var stream = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteGreetingAsync(stream, expected);
+        stream.Position = 0;
+        Assert.Equal(expected, await LengthPrefixedJsonProtocol.ReadGreetingAsync(stream));
+        foreach (var invalid in new[] { expected with { ProtocolVersion = 1 }, expected with { ServiceInstanceId = Guid.Empty } })
+            await Assert.ThrowsAsync<ControlProtocolException>(() => LengthPrefixedJsonProtocol.WriteGreetingAsync(new MemoryStream(), invalid));
+    }
+
+    [Fact]
+    public async Task EveryCommandRequiresItsExactClosedResultType()
+    {
+        var snapshot = EmptySnapshot("machine");
+        var valid = new (ControlCommand Command, ControlResponseResult Result)[]
+        {
+            (ControlCommand.Status, new ControlStatusResult(ControlConnectionState.Disconnected)),
+            (ControlCommand.Snapshot, new ControlSnapshotResult(snapshot)),
+            (ControlCommand.Connect, new ControlConnectResult(ControlConnectionState.Connected)),
+            (ControlCommand.Disconnect, new ControlDisconnectResult(ControlConnectionState.Disconnected))
+        };
+        foreach (var item in valid)
+        {
+            await using var stream = new MemoryStream();
+            var expected = Response(item.Result, item.Command);
+            await LengthPrefixedJsonProtocol.WriteResponseAsync(stream, expected);
+            stream.Position = 0;
+            var actual = await LengthPrefixedJsonProtocol.ReadResponseAsync(stream);
+            Assert.Equal(expected.ProtocolVersion, actual.ProtocolVersion);
+            Assert.Equal(expected.ServiceInstanceId, actual.ServiceInstanceId);
+            Assert.Equal(expected.RequestId, actual.RequestId);
+            Assert.Equal(expected.Command, actual.Command);
+            Assert.Equal(expected.Outcome, actual.Outcome);
+            Assert.Equal(expected.ErrorCode, actual.ErrorCode);
+            Assert.IsType(item.Result.GetType(), actual.Result);
+            if (actual.Result is ControlSnapshotResult actualSnapshot)
+            {
+                Assert.Equal(snapshot.CapturedAtUtc, actualSnapshot.Snapshot.CapturedAtUtc);
+                Assert.Equal(snapshot.MachineName, actualSnapshot.Snapshot.MachineName);
+                Assert.Empty(actualSnapshot.Snapshot.Adapters);
+                Assert.Empty(actualSnapshot.Snapshot.Routes);
+                Assert.Empty(actualSnapshot.Snapshot.DnsInterfaces);
+            }
+            else
+            {
+                Assert.Equal(item.Result, actual.Result);
+            }
+        }
+        await Assert.ThrowsAsync<ControlProtocolException>(() => LengthPrefixedJsonProtocol.WriteResponseAsync(
+            new MemoryStream(), Response(new ControlSnapshotResult(snapshot), ControlCommand.Status)));
+    }
+
+    [Fact]
+    public async Task FailedResponseRequiresNullResultAndResponseTooLargeIsStableAndSmall()
+    {
+        var failure = Response(null, ControlCommand.Snapshot, ControlOutcome.Failed, ControlErrorCode.ResponseTooLarge);
+        await using var stream = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteResponseAsync(stream, failure);
+        Assert.InRange(stream.Length, 1, ControlProtocolConstants.MaximumResponseSize + ControlProtocolConstants.LengthPrefixSize);
+        await Assert.ThrowsAsync<ControlProtocolException>(() => LengthPrefixedJsonProtocol.WriteResponseAsync(
+            new MemoryStream(), failure with { Result = new ControlSnapshotResult(EmptySnapshot("machine")) }));
     }
 
     [Theory]
@@ -173,10 +243,29 @@ public sealed class ControlProtocolSecurityTests
         var exception = await Assert.ThrowsAsync<ControlProtocolException>(() =>
             LengthPrefixedJsonProtocol.WriteResponseAsync(
                 stream,
-                Response(new string('x', ControlProtocolConstants.MaximumResponseSize))));
+                SnapshotResponse(new string('x', ControlProtocolConstants.MaximumResponseSize))));
 
         Assert.Equal(ControlProtocolError.FrameTooLarge, exception.Error);
         Assert.Equal(0, stream.Length);
+    }
+
+    [Fact]
+    public async Task SnapshotResponseHonorsExactOneMiBBoundaryWithoutTruncationOrMultipleFrames()
+    {
+        await using var baseline = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteResponseAsync(baseline, SnapshotResponse(string.Empty));
+        var overhead = checked((int)baseline.Length - ControlProtocolConstants.LengthPrefixSize);
+        var exactMachineName = new string('x', ControlProtocolConstants.MaximumResponseSize - overhead);
+        await using var exact = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteResponseAsync(exact, SnapshotResponse(exactMachineName));
+        Assert.Equal(ControlProtocolConstants.MaximumResponseSize + ControlProtocolConstants.LengthPrefixSize, exact.Length);
+        Assert.Equal(ControlProtocolConstants.MaximumResponseSize,
+            BinaryPrimitives.ReadInt32BigEndian(exact.ToArray().AsSpan(0, ControlProtocolConstants.LengthPrefixSize)));
+        await using var oversized = new MemoryStream();
+        var exception = await Assert.ThrowsAsync<ControlProtocolException>(() =>
+            LengthPrefixedJsonProtocol.WriteResponseAsync(oversized, SnapshotResponse(exactMachineName + "x")));
+        Assert.Equal(ControlProtocolError.FrameTooLarge, exception.Error);
+        Assert.Equal(0, oversized.Length);
     }
 
     [Fact]
@@ -261,7 +350,7 @@ public sealed class ControlProtocolSecurityTests
 
         var privilegedTypeTerms = new[]
         {
-            "Route", "Dns", "Gateway", "Provider", "Native", "Restoration",
+            "Provider", "Native", "Restoration",
             "Approval", "Grant", "Capability", "OwnedNetworkChange"
         };
         var protocolTypes = typeof(ControlRequestEnvelope).Assembly.GetTypes();
@@ -299,7 +388,14 @@ public sealed class ControlProtocolSecurityTests
     }
 
     private static string ValidRequestJson()
-        => "{\"protocolVersion\":1,\"serviceInstanceId\":\"11111111-1111-1111-1111-111111111111\",\"requestId\":\"22222222-2222-2222-2222-222222222222\",\"sentAtUtc\":\"2026-01-02T03:04:05+00:00\",\"command\":\"STATUS\",\"payload\":{}}";
+        => "{\"protocolVersion\":2,\"serviceInstanceId\":\"11111111-1111-1111-1111-111111111111\",\"requestId\":\"22222222-2222-2222-2222-222222222222\",\"sentAtUtc\":\"2026-01-02T03:04:05+00:00\",\"command\":\"STATUS\",\"payload\":{}}";
+
+    private static ControlResponseEnvelope SnapshotResponse(string machineName)
+        => Response(new ControlSnapshotResult(EmptySnapshot(machineName)), ControlCommand.Snapshot);
+
+    private static ControlNetworkSnapshot EmptySnapshot(string machineName)
+        => new(DateTimeOffset.Parse("2026-01-02T03:04:05+00:00"), machineName,
+            Array.Empty<ControlAdapterState>(), Array.Empty<ControlRouteState>(), Array.Empty<ControlDnsInterfaceState>());
 
     private static string RemoveProperty(string json, string property)
     {
