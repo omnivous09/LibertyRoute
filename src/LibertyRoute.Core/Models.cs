@@ -69,7 +69,8 @@ public sealed record NetworkTransaction(
     NetworkStateSnapshot Snapshot,
     IReadOnlyList<OwnedNetworkChange> Changes,
     string? EngineId,
-    string? LastError);
+    string? LastError,
+    string? OwnerSid = null);
 
 public sealed record VpnServerConfig(
     string Id,

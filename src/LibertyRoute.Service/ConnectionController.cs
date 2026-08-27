@@ -38,16 +38,23 @@ public sealed class ConnectionController
         }
     }
 
-    public async Task<NetworkTransaction> BeginSafeConnectAsync(CancellationToken cancellationToken)
+    public async Task<NetworkTransaction> BeginSafeConnectAsync(
+        string? ownerSid,
+        CancellationToken cancellationToken)
     {
+        var canonicalOwnerSid = WindowsControlCallerIdentityCapture.CanonicalizeUserSid(ownerSid);
         await _networkLock.WaitAsync(cancellationToken);
         try
         {
             if (_active is not null)
                 throw new InvalidOperationException("A LibertyRoute network transaction is already active.");
 
-            if (await _journal.ReadActiveAsync(cancellationToken) is not null)
+            var existing = await _journal.ReadActiveAsync(cancellationToken);
+            if (existing is not null)
+            {
+                ValidatePersistedOwner(existing);
                 throw new InvalidOperationException("An unfinished session exists and must be recovered before connecting.");
+            }
 
             var snapshot = await _network.CaptureStateAsync(cancellationToken);
             var transaction = new NetworkTransaction(
@@ -57,7 +64,8 @@ public sealed class ConnectionController
                 snapshot,
                 Array.Empty<OwnedNetworkChange>(),
                 _engine.Id,
-                null);
+                null,
+                canonicalOwnerSid);
 
             // Critical invariant: persist the rollback state before any network mutation.
             await _journal.WriteAsync(transaction, cancellationToken);
@@ -78,6 +86,7 @@ public sealed class ConnectionController
             var tx = _active ?? await _journal.ReadActiveAsync(cancellationToken);
             if (tx is null)
                 return;
+            ValidatePersistedOwner(tx);
 
             tx = tx with { State = ConnectionState.RollingBack, LastError = reason };
             await _journal.WriteAsync(tx, cancellationToken);
@@ -112,8 +121,15 @@ public sealed class ConnectionController
         var tx = await _journal.ReadActiveAsync(cancellationToken);
         if (tx is null)
             return;
+        ValidatePersistedOwner(tx);
 
         _active = tx;
         await RollbackAsync("Recovered unfinished session during service startup.", cancellationToken);
+    }
+
+    private static void ValidatePersistedOwner(NetworkTransaction transaction)
+    {
+        if (transaction.OwnerSid is not null)
+            _ = WindowsControlCallerIdentityCapture.CanonicalizeUserSid(transaction.OwnerSid);
     }
 }

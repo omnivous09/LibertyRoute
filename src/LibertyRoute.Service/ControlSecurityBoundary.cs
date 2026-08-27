@@ -34,6 +34,27 @@ internal sealed record ControlCallerIdentity
 
 internal static class WindowsControlCallerIdentityCapture
 {
+    internal static string CanonicalizeUserSid(string? userSid)
+    {
+        if (string.IsNullOrWhiteSpace(userSid))
+            throw new ArgumentException("A nonempty owner SID is required.", nameof(userSid));
+
+        SecurityIdentifier sid;
+        try
+        {
+            sid = new SecurityIdentifier(userSid);
+        }
+        catch (ArgumentException exception)
+        {
+            throw new ArgumentException("The owner SID is malformed.", nameof(userSid), exception);
+        }
+
+        if (!StringComparer.Ordinal.Equals(userSid, sid.Value))
+            throw new ArgumentException("The owner SID must use its canonical representation.", nameof(userSid));
+
+        return sid.Value;
+    }
+
     internal static ControlCallerIdentity Capture(NamedPipeServerStream server)
     {
         ArgumentNullException.ThrowIfNull(server);
@@ -49,7 +70,7 @@ internal static class WindowsControlCallerIdentityCapture
             var principal = new WindowsPrincipal(identity);
 
             captured = new ControlCallerIdentity(
-                user.Value,
+                CanonicalizeUserSid(user.Value),
                 identity.Groups?.Select(group => group.Value) ?? Array.Empty<string>(),
                 identity.IsAuthenticated,
                 principal.IsInRole(administratorSid),

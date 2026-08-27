@@ -18,14 +18,21 @@ public sealed class FileTransactionJournal : ITransactionJournal
     public string JournalPath { get; }
 
     public FileTransactionJournal()
-    {
-        var basePath = Path.Combine(
+        : this(Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "LibertyRoute",
-            "transactions");
+            "transactions",
+            "active.lrj"))
+    {
+    }
 
-        Directory.CreateDirectory(basePath);
-        JournalPath = Path.Combine(basePath, "active.lrj");
+    internal FileTransactionJournal(string journalPath)
+    {
+        if (string.IsNullOrWhiteSpace(journalPath))
+            throw new ArgumentException("Journal path is required.", nameof(journalPath));
+
+        JournalPath = journalPath;
+        Directory.CreateDirectory(Path.GetDirectoryName(JournalPath)!);
     }
 
     public async Task WriteAsync(NetworkTransaction transaction, CancellationToken cancellationToken)

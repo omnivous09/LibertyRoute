@@ -194,6 +194,7 @@ public sealed class ControlPipeSecurityTests
         Assert.Equal(ControlConnectionState.SnapshotCommitted, Assert.IsType<ControlConnectResult>(connect.Result).State);
         Assert.Equal(2, network.Captures);
         Assert.Equal(1, journal.Writes);
+        Assert.Equal(caller.UserSid, journal.Active!.OwnerSid);
 
         var disconnect = await dispatcher.DispatchAsync(caller, Request() with { Command = ControlCommand.Disconnect }, CancellationToken.None);
         Assert.Equal(ControlConnectionState.Disconnected, Assert.IsType<ControlDisconnectResult>(disconnect.Result).State);

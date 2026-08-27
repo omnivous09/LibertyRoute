@@ -18,7 +18,7 @@ internal sealed class ControlCommandDispatcher : IControlCommandDispatcher
         {
             ControlCommand.Status => new ControlStatusResult(MapState(_controller.State)),
             ControlCommand.Snapshot => new ControlSnapshotResult(MapSnapshot(await _controller.CaptureDiagnosticSnapshotAsync(cancellationToken))),
-            ControlCommand.Connect => new ControlConnectResult(MapState((await _controller.BeginSafeConnectAsync(cancellationToken)).State)),
+            ControlCommand.Connect => new ControlConnectResult(MapState((await _controller.BeginSafeConnectAsync(caller.UserSid, cancellationToken)).State)),
             ControlCommand.Disconnect => await DisconnectAsync(cancellationToken),
             _ => throw new InvalidOperationException("The control command is not supported.")
         };
