@@ -13,7 +13,8 @@ internal sealed record ControlCallerIdentity
         bool isAuthenticated,
         bool isBuiltinAdministrator,
         bool hasNetworkLogonSid,
-        bool isLocalSystem)
+        bool isLocalSystem,
+        bool isInteractive = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(userSid);
         UserSid = userSid;
@@ -22,6 +23,7 @@ internal sealed record ControlCallerIdentity
         IsBuiltinAdministrator = isBuiltinAdministrator;
         HasNetworkLogonSid = hasNetworkLogonSid;
         IsLocalSystem = isLocalSystem;
+        IsInteractive = isInteractive;
     }
 
     public string UserSid { get; }
@@ -30,6 +32,7 @@ internal sealed record ControlCallerIdentity
     public bool IsBuiltinAdministrator { get; }
     public bool HasNetworkLogonSid { get; }
     public bool IsLocalSystem { get; }
+    public bool IsInteractive { get; }
 }
 
 internal static class WindowsControlCallerIdentityCapture
@@ -67,6 +70,7 @@ internal static class WindowsControlCallerIdentityCapture
             var administratorSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
             var networkSid = new SecurityIdentifier(WellKnownSidType.NetworkSid, null);
             var localSystemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+            var interactiveSid = new SecurityIdentifier(WellKnownSidType.InteractiveSid, null);
             var principal = new WindowsPrincipal(identity);
 
             captured = new ControlCallerIdentity(
@@ -75,7 +79,8 @@ internal static class WindowsControlCallerIdentityCapture
                 identity.IsAuthenticated,
                 principal.IsInRole(administratorSid),
                 principal.IsInRole(networkSid),
-                user.Equals(localSystemSid));
+                user.Equals(localSystemSid),
+                principal.IsInRole(interactiveSid));
         });
 
         return captured ?? throw new UnauthorizedAccessException("The caller identity could not be captured.");
@@ -107,7 +112,7 @@ internal sealed class ControlCommandAuthorization
             return ControlAuthorizationDecision.Unauthenticated;
         if (caller.HasNetworkLogonSid)
             return ControlAuthorizationDecision.NetworkLogonDenied;
-        return caller.IsLocalSystem || caller.IsBuiltinAdministrator
+        return caller.IsLocalSystem || caller.IsBuiltinAdministrator || caller.IsInteractive
             ? ControlAuthorizationDecision.Authorized
             : ControlAuthorizationDecision.Forbidden;
     }

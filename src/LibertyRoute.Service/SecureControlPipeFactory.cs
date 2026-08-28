@@ -31,9 +31,10 @@ internal sealed class SecureControlPipeFactory
         var networkSid = new SecurityIdentifier(WellKnownSidType.NetworkSid, null);
         var localSystemSid = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
         var administratorsSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+        var interactiveSid = new SecurityIdentifier(WellKnownSidType.InteractiveSid, null);
 
         security.AddAccessRule(new PipeAccessRule(networkSid, DuplexClientRights, AccessControlType.Deny));
-        foreach (var allowedSid in new[] { _serviceSid, localSystemSid, administratorsSid }.Distinct())
+        foreach (var allowedSid in new[] { _serviceSid, localSystemSid, administratorsSid, interactiveSid }.Distinct())
             security.AddAccessRule(new PipeAccessRule(allowedSid, DuplexClientRights, AccessControlType.Allow));
 
         return security;

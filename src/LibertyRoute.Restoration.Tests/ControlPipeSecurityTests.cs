@@ -33,6 +33,10 @@ public sealed class ControlPipeSecurityTests
         AssertRule(rules, WellKnownSidType.NetworkSid, AccessControlType.Deny);
         AssertRule(rules, WellKnownSidType.LocalSystemSid, AccessControlType.Allow);
         AssertRule(rules, WellKnownSidType.BuiltinAdministratorsSid, AccessControlType.Allow);
+        AssertNormalizedAllowRule(
+            rules,
+            WellKnownSidType.InteractiveSid,
+            PipeAccessRights.ReadWrite);
         Assert.Contains(rules, rule =>
             ((SecurityIdentifier)rule.IdentityReference).Equals(serviceSid) &&
             rule.AccessControlType == AccessControlType.Allow &&
@@ -41,6 +45,7 @@ public sealed class ControlPipeSecurityTests
         AssertNoRule(rules, WellKnownSidType.WorldSid);
         AssertNoRule(rules, WellKnownSidType.AuthenticatedUserSid);
         AssertNoRule(rules, WellKnownSidType.BuiltinUsersSid);
+        AssertNoRule(rules, WellKnownSidType.AnonymousSid);
         Assert.All(rules, rule =>
         {
             Assert.True(HasRequiredDuplexRights(rule.PipeAccessRights));
@@ -82,11 +87,13 @@ public sealed class ControlPipeSecurityTests
         var principal = new WindowsPrincipal(principalIdentity);
         var adminSid = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
         var networkSid = new SecurityIdentifier(WellKnownSidType.NetworkSid, null);
+        var interactiveSid = new SecurityIdentifier(WellKnownSidType.InteractiveSid, null);
 
         Assert.Equal(current.User!.Value, caller.UserSid);
         Assert.Equal(current.User.Equals(systemSid), caller.IsLocalSystem);
         Assert.Equal(principal.IsInRole(adminSid), caller.IsBuiltinAdministrator);
         Assert.Equal(principal.IsInRole(networkSid), caller.HasNetworkLogonSid);
+        Assert.Equal(principal.IsInRole(interactiveSid), caller.IsInteractive);
         Assert.DoesNotContain(
             typeof(ControlCallerIdentity).GetProperties(),
             property => typeof(WindowsIdentity).IsAssignableFrom(property.PropertyType) ||
@@ -94,19 +101,23 @@ public sealed class ControlPipeSecurityTests
     }
 
     [Theory]
-    [InlineData(false, false, false, false, "Unauthenticated")]
-    [InlineData(true, true, true, false, "NetworkLogonDenied")]
-    [InlineData(true, false, false, false, "Forbidden")]
-    [InlineData(true, true, false, false, "Authorized")]
-    [InlineData(true, false, false, true, "Authorized")]
+    [InlineData(false, false, false, false, true, "Unauthenticated")]
+    [InlineData(true, false, false, false, true, "Authorized")]
+    [InlineData(true, false, false, false, false, "Forbidden")]
+    [InlineData(true, true, false, false, false, "Authorized")]
+    [InlineData(true, false, false, true, false, "Authorized")]
+    [InlineData(true, false, true, false, true, "NetworkLogonDenied")]
+    [InlineData(true, true, true, false, false, "NetworkLogonDenied")]
+    [InlineData(true, true, true, true, true, "NetworkLogonDenied")]
     public void PrincipalPolicyIsFailClosed(
         bool authenticated,
         bool administrator,
         bool network,
         bool localSystem,
+        bool interactive,
         string expected)
     {
-        var caller = Caller("S-1-5-21-1", authenticated, administrator, network, localSystem);
+        var caller = Caller("S-1-5-21-1", authenticated, administrator, network, localSystem, interactive);
         var policy = new ControlCommandAuthorization();
         Assert.Equal(expected, policy.AuthorizePrincipal(caller).ToString());
         foreach (var command in Enum.GetValues<ControlCommand>())
@@ -520,11 +531,116 @@ public sealed class ControlPipeSecurityTests
     {
         var dispatcher = new FakeDispatcher();
         var handler = Handler(dispatcher);
+        var stream = new DuplexStream(Array.Empty<byte>(), throwOnRead: true);
         await handler.HandleAuthenticatedForTestsAsync(
-            new ThrowOnReadStream(),
+            stream,
             Caller("S-1-5-21-1", administrator: false),
             CancellationToken.None);
         Assert.Equal(0, dispatcher.Calls);
+        Assert.Empty(stream.Written);
+    }
+
+    [Fact]
+    public async Task NetworkCallerIsRejectedBeforeGreetingReadOrDispatchDespiteAllowConditions()
+    {
+        var dispatcher = new FakeDispatcher();
+        var handler = Handler(dispatcher);
+        var stream = new DuplexStream(Array.Empty<byte>(), throwOnRead: true);
+
+        await handler.HandleAuthenticatedForTestsAsync(
+            stream,
+            Caller(
+                "S-1-5-21-1",
+                administrator: true,
+                network: true,
+                localSystem: true,
+                interactive: true),
+            CancellationToken.None);
+
+        Assert.Equal(0, dispatcher.Calls);
+        Assert.Empty(stream.Written);
+    }
+
+    [Fact]
+    public async Task InteractivePrincipalReachesV2AndExistingOwnerAuthorizationRemainsAuthoritative()
+    {
+        var network = new FakeNetworkStateManager(DiagnosticSnapshot());
+        var journal = new FakeTransactionJournal();
+        var engine = new FakeConnectionEngine();
+        var controller = new ConnectionController(network, journal, engine);
+        var handler = Handler(new ControlCommandDispatcher(controller));
+        var owner = Caller("S-1-5-21-1001", administrator: false, interactive: true);
+        var sameOwner = Caller("S-1-5-21-1001", administrator: false, interactive: true);
+        var foreign = Caller("S-1-5-21-1002", administrator: false, interactive: true);
+
+        var emptyStatus = await InvokeAsync(handler, Request(), owner);
+        Assert.Equal(ControlOutcome.Succeeded, emptyStatus!.Outcome);
+        Assert.Equal(
+            ControlConnectionState.Disconnected,
+            Assert.IsType<ControlStatusResult>(emptyStatus.Result).State);
+
+        var connect = await InvokeAsync(
+            handler,
+            Request() with { Command = ControlCommand.Connect },
+            owner);
+        Assert.Equal(ControlOutcome.Succeeded, connect!.Outcome);
+        Assert.Equal(owner.UserSid, journal.Active!.OwnerSid);
+
+        var ownerStatus = await InvokeAsync(handler, Request(), sameOwner);
+        Assert.Equal(ControlOutcome.Succeeded, ownerStatus!.Outcome);
+        Assert.Equal(
+            ControlConnectionState.SnapshotCommitted,
+            Assert.IsType<ControlStatusResult>(ownerStatus.Result).State);
+
+        var foreignStatus = await InvokeAsync(handler, Request(), foreign);
+        Assert.Equal(ControlErrorCode.ForbiddenCommand, foreignStatus!.ErrorCode);
+        Assert.Null(foreignStatus.Result);
+
+        var writesBeforeDenials = journal.Writes;
+        var capturesBeforeSnapshot = network.Captures;
+        var foreignDisconnect = await InvokeAsync(
+            handler,
+            Request() with { Command = ControlCommand.Disconnect },
+            foreign);
+        Assert.Equal(ControlErrorCode.ForbiddenCommand, foreignDisconnect!.ErrorCode);
+        Assert.Null(foreignDisconnect.Result);
+        Assert.Equal(writesBeforeDenials, journal.Writes);
+        Assert.Equal(0, journal.Clears);
+        Assert.Equal(0, engine.Stops);
+        Assert.Equal(0, network.Verifications);
+
+        var snapshot = await InvokeAsync(
+            handler,
+            Request() with { Command = ControlCommand.Snapshot },
+            owner);
+        Assert.Equal(ControlErrorCode.ForbiddenCommand, snapshot!.ErrorCode);
+        Assert.Null(snapshot.Result);
+        Assert.Equal(capturesBeforeSnapshot, network.Captures);
+
+        var disconnect = await InvokeAsync(
+            handler,
+            Request() with { Command = ControlCommand.Disconnect },
+            sameOwner);
+        Assert.Equal(ControlOutcome.Succeeded, disconnect!.Outcome);
+        Assert.Equal(1, journal.Clears);
+        Assert.Equal(1, engine.Stops);
+        Assert.Equal(1, network.Verifications);
+    }
+
+    [Fact]
+    public void ProtocolCannotSupplyCallerIdentityOrAdmissionProperties()
+    {
+        var forbiddenNames = new[]
+        {
+            "UserSid", "GroupSids", "IsAuthenticated", "IsBuiltinAdministrator",
+            "HasNetworkLogonSid", "IsLocalSystem", "IsInteractive"
+        };
+        var protocolProperties = typeof(ControlRequestEnvelope).GetProperties()
+            .Concat(typeof(ControlRequestPayload).GetProperties())
+            .Select(property => property.Name)
+            .ToArray();
+
+        Assert.All(forbiddenNames, name => Assert.DoesNotContain(name, protocolProperties));
     }
 
     [Fact]
@@ -771,6 +887,18 @@ public sealed class ControlPipeSecurityTests
         Assert.DoesNotContain(rules, rule => ((SecurityIdentifier)rule.IdentityReference).Equals(sid));
     }
 
+    private static void AssertNormalizedAllowRule(
+        IEnumerable<PipeAccessRule> rules,
+        WellKnownSidType sidType,
+        PipeAccessRights rights)
+    {
+        var sid = new SecurityIdentifier(sidType, null);
+        Assert.Contains(rules, rule =>
+            ((SecurityIdentifier)rule.IdentityReference).Equals(sid) &&
+            rule.AccessControlType == AccessControlType.Allow &&
+            rule.PipeAccessRights == (rights | PipeAccessRights.Synchronize));
+    }
+
     private static bool HasRequiredDuplexRights(PipeAccessRights rights)
         => (rights & PipeAccessRights.ReadWrite) == PipeAccessRights.ReadWrite;
 
@@ -779,8 +907,9 @@ public sealed class ControlPipeSecurityTests
         bool authenticated = true,
         bool administrator = true,
         bool network = false,
-        bool localSystem = false)
-        => new(sid, Array.Empty<string>(), authenticated, administrator, network, localSystem);
+        bool localSystem = false,
+        bool interactive = false)
+        => new(sid, Array.Empty<string>(), authenticated, administrator, network, localSystem, interactive);
 
     private static ControlRequestEnvelope Request(DateTimeOffset? sentAt = null) => new(
         ControlProtocolConstants.Version,
@@ -797,7 +926,7 @@ public sealed class ControlPipeSecurityTests
         => guard.ReserveAsync(caller, request, CancellationToken.None);
 
     private static SecureControlConnectionHandler Handler(
-        FakeDispatcher dispatcher,
+        IControlCommandDispatcher dispatcher,
         ControlRequestReplayGuard? replayGuard = null,
         ControlCommandAuthorization? authorization = null)
         => new(
