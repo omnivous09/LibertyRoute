@@ -1,9 +1,27 @@
+using System.Security.Principal;
 using LibertyRoute.Core;
 using LibertyRoute.Engine;
 using LibertyRoute.Networking;
 using LibertyRoute.Recovery;
 
 namespace LibertyRoute.Service;
+
+internal enum SessionAuthorizationDecision
+{
+    NoActiveSession,
+    OwnerAuthorized,
+    OperationalOverrideAuthorized,
+    ForeignOwnerDenied,
+    LegacyOwnerDenied,
+    InvalidOwnerDenied,
+    InconsistentStateDenied
+}
+
+internal sealed record SessionAuthorizationResult(
+    SessionAuthorizationDecision Decision,
+    ConnectionState State,
+    Guid? SessionId,
+    NetworkTransaction? AuthorizedTransaction = null);
 
 public sealed class ConnectionController
 {
@@ -88,6 +106,164 @@ public sealed class ConnectionController
                 return;
             ValidatePersistedOwner(tx);
 
+            await RollbackCoreUnderLockAsync(tx, reason, cancellationToken);
+        }
+        finally
+        {
+            _networkLock.Release();
+        }
+    }
+
+    internal async Task<SessionAuthorizationResult> GetStatusAuthorizedAsync(
+        ControlCallerIdentity caller,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(caller);
+        await _networkLock.WaitAsync(cancellationToken);
+        try
+        {
+            return await EvaluateSessionAuthorizationUnderLockAsync(caller, cancellationToken);
+        }
+        finally
+        {
+            _networkLock.Release();
+        }
+    }
+
+    internal async Task<SessionAuthorizationResult> RollbackAuthorizedAsync(
+        ControlCallerIdentity caller,
+        string? reason,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(caller);
+        await _networkLock.WaitAsync(cancellationToken);
+        try
+        {
+            var authResult = await EvaluateSessionAuthorizationUnderLockAsync(caller, cancellationToken);
+            if (authResult.Decision is SessionAuthorizationDecision.OwnerAuthorized
+                or SessionAuthorizationDecision.OperationalOverrideAuthorized)
+            {
+                var tx = authResult.AuthorizedTransaction
+                    ?? throw new InvalidOperationException("Authorized session transaction is unavailable.");
+                await RollbackCoreUnderLockAsync(tx, reason, cancellationToken);
+            }
+
+            return authResult;
+        }
+        finally
+        {
+            _networkLock.Release();
+        }
+    }
+
+    public async Task RecoverOnStartupAsync(CancellationToken cancellationToken)
+    {
+        var tx = await _journal.ReadActiveAsync(cancellationToken);
+        if (tx is null)
+            return;
+        ValidatePersistedOwner(tx);
+
+        _active = tx;
+        await RollbackAsync("Recovered unfinished session during service startup.", cancellationToken);
+    }
+
+    private async Task<SessionAuthorizationResult> EvaluateSessionAuthorizationUnderLockAsync(
+        ControlCallerIdentity caller,
+        CancellationToken cancellationToken)
+    {
+        NetworkTransaction? journalTx;
+        try
+        {
+            journalTx = await _journal.ReadActiveAsync(cancellationToken);
+        }
+        catch
+        {
+            return new SessionAuthorizationResult(
+                SessionAuthorizationDecision.InconsistentStateDenied,
+                ConnectionState.Disconnected,
+                _active?.SessionId);
+        }
+
+        if (_active is null && journalTx is null)
+        {
+            return new SessionAuthorizationResult(
+                SessionAuthorizationDecision.NoActiveSession,
+                ConnectionState.Disconnected,
+                null);
+        }
+
+        if (_active is not null && journalTx is null)
+        {
+            return new SessionAuthorizationResult(
+                SessionAuthorizationDecision.InconsistentStateDenied,
+                _active.State,
+                _active.SessionId);
+        }
+
+        if (_active is not null && journalTx is not null)
+        {
+            if (_active.SessionId != journalTx.SessionId ||
+                !StringComparer.Ordinal.Equals(_active.OwnerSid, journalTx.OwnerSid))
+            {
+                return new SessionAuthorizationResult(
+                    SessionAuthorizationDecision.InconsistentStateDenied,
+                    _active.State,
+                    _active.SessionId);
+            }
+        }
+
+        var targetTx = journalTx!;
+        var sessionId = targetTx.SessionId;
+        var state = targetTx.State;
+        var isOverrideEligible = caller.IsBuiltinAdministrator || caller.IsLocalSystem;
+
+        if (targetTx.OwnerSid is null)
+        {
+            return new SessionAuthorizationResult(
+                isOverrideEligible
+                    ? SessionAuthorizationDecision.OperationalOverrideAuthorized
+                    : SessionAuthorizationDecision.LegacyOwnerDenied,
+                state,
+                sessionId,
+                isOverrideEligible ? targetTx : null);
+        }
+
+        if (!IsValidCanonicalSid(targetTx.OwnerSid))
+        {
+            return new SessionAuthorizationResult(
+                isOverrideEligible
+                    ? SessionAuthorizationDecision.OperationalOverrideAuthorized
+                    : SessionAuthorizationDecision.InvalidOwnerDenied,
+                state,
+                sessionId,
+                isOverrideEligible ? targetTx : null);
+        }
+
+        if (StringComparer.Ordinal.Equals(caller.UserSid, targetTx.OwnerSid))
+        {
+            return new SessionAuthorizationResult(
+                SessionAuthorizationDecision.OwnerAuthorized,
+                state,
+                sessionId,
+                targetTx);
+        }
+
+        return new SessionAuthorizationResult(
+            isOverrideEligible
+                ? SessionAuthorizationDecision.OperationalOverrideAuthorized
+                : SessionAuthorizationDecision.ForeignOwnerDenied,
+            state,
+            sessionId,
+            isOverrideEligible ? targetTx : null);
+    }
+
+    private async Task RollbackCoreUnderLockAsync(
+        NetworkTransaction tx,
+        string? reason,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
             tx = tx with { State = ConnectionState.RollingBack, LastError = reason };
             await _journal.WriteAsync(tx, cancellationToken);
 
@@ -110,21 +286,22 @@ public sealed class ConnectionController
             }
             throw;
         }
-        finally
-        {
-            _networkLock.Release();
-        }
     }
 
-    public async Task RecoverOnStartupAsync(CancellationToken cancellationToken)
+    private static bool IsValidCanonicalSid(string? sidText)
     {
-        var tx = await _journal.ReadActiveAsync(cancellationToken);
-        if (tx is null)
-            return;
-        ValidatePersistedOwner(tx);
+        if (string.IsNullOrWhiteSpace(sidText))
+            return false;
 
-        _active = tx;
-        await RollbackAsync("Recovered unfinished session during service startup.", cancellationToken);
+        try
+        {
+            var sid = new SecurityIdentifier(sidText);
+            return StringComparer.Ordinal.Equals(sidText, sid.Value);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static void ValidatePersistedOwner(NetworkTransaction transaction)

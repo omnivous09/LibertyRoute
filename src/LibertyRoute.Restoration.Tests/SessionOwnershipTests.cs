@@ -213,6 +213,342 @@ public sealed class SessionOwnershipTests
     }
 
     [Fact]
+    public async Task ExactOwnerSidAuthorizesStatusAndRollback()
+    {
+        var network = new Network();
+        var journal = new Journal();
+        var engine = new Engine();
+        var controller = Controller(network, journal, engine);
+        var caller = Caller(OwnerA);
+
+        var created = await controller.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+
+        var statusAuth = await controller.GetStatusAuthorizedAsync(caller, CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OwnerAuthorized, statusAuth.Decision);
+        Assert.Equal(ConnectionState.SnapshotCommitted, statusAuth.State);
+        Assert.Equal(created.SessionId, statusAuth.SessionId);
+
+        var rollbackAuth = await controller.RollbackAuthorizedAsync(caller, "user requested", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OwnerAuthorized, rollbackAuth.Decision);
+        Assert.Equal(ConnectionState.Disconnected, controller.State);
+        Assert.Equal(1, engine.Stops);
+        Assert.Equal(1, journal.Clears);
+    }
+
+    [Fact]
+    public async Task SeparateCallerObjectWithSameSidIsSameOwner()
+    {
+        var network = new Network();
+        var journal = new Journal();
+        var engine = new Engine();
+        var controller = Controller(network, journal, engine);
+
+        var created = await controller.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+
+        var caller1 = new ControlCallerIdentity(OwnerA, new[] { "S-1-5-32-545" }, true, false, false, false);
+        var caller2 = new ControlCallerIdentity(OwnerA, new[] { "S-1-5-11" }, true, false, false, false);
+
+        var status1 = await controller.GetStatusAuthorizedAsync(caller1, CancellationToken.None);
+        var status2 = await controller.GetStatusAuthorizedAsync(caller2, CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OwnerAuthorized, status1.Decision);
+        Assert.Equal(SessionAuthorizationDecision.OwnerAuthorized, status2.Decision);
+
+        var rollback = await controller.RollbackAuthorizedAsync(caller2, "user requested", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OwnerAuthorized, rollback.Decision);
+        Assert.Equal(ConnectionState.Disconnected, controller.State);
+        Assert.Equal(1, engine.Stops);
+    }
+
+    [Fact]
+    public async Task AdminMatchingOwnerIsClassifiedAsOwnerAuthorizedNotOverride()
+    {
+        var network = new Network();
+        var journal = new Journal();
+        var engine = new Engine();
+        var controller = Controller(network, journal, engine);
+        var adminOwnerCaller = Caller(OwnerA, administrator: true);
+
+        await controller.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+
+        var statusAuth = await controller.GetStatusAuthorizedAsync(adminOwnerCaller, CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OwnerAuthorized, statusAuth.Decision);
+
+        var rollbackAuth = await controller.RollbackAuthorizedAsync(adminOwnerCaller, "admin owner disconnect", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OwnerAuthorized, rollbackAuth.Decision);
+    }
+
+    [Fact]
+    public async Task StatusAndDisconnectOnNoJournalReturnNoActiveSessionDisconnected()
+    {
+        var network = new Network();
+        var journal = new Journal();
+        var engine = new Engine();
+        var controller = Controller(network, journal, engine);
+        var caller = Caller(OwnerA);
+
+        var statusAuth = await controller.GetStatusAuthorizedAsync(caller, CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.NoActiveSession, statusAuth.Decision);
+        Assert.Equal(ConnectionState.Disconnected, statusAuth.State);
+        Assert.Null(statusAuth.SessionId);
+
+        var rollbackAuth = await controller.RollbackAuthorizedAsync(caller, "disconnect empty", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.NoActiveSession, rollbackAuth.Decision);
+        Assert.Equal(ConnectionState.Disconnected, rollbackAuth.State);
+        Assert.Empty(journal.Writes);
+        Assert.Equal(0, engine.Stops);
+        Assert.Equal(0, journal.Clears);
+    }
+
+    [Fact]
+    public async Task JournalOwnerAuthorizesEvenWhenActiveIsNullAfterSimulatedRestart()
+    {
+        var existingTx = Transaction(OwnerA) with { State = ConnectionState.Connected };
+        var journal = new Journal { Active = existingTx };
+        var engine = new Engine();
+        var controller = Controller(new Network(), journal, engine);
+        var ownerCaller = Caller(OwnerA);
+
+        var statusAuth = await controller.GetStatusAuthorizedAsync(ownerCaller, CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OwnerAuthorized, statusAuth.Decision);
+        Assert.Equal(ConnectionState.Connected, statusAuth.State);
+        Assert.Equal(existingTx.SessionId, statusAuth.SessionId);
+
+        var rollbackAuth = await controller.RollbackAuthorizedAsync(ownerCaller, "restart cleanup", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OwnerAuthorized, rollbackAuth.Decision);
+        Assert.Equal(1, engine.Stops);
+        Assert.Equal(1, journal.Clears);
+        Assert.Null(journal.Active);
+    }
+
+    [Fact]
+    public async Task AuthorizedRestartDisconnectRollsBackExactTransactionFromSingleJournalRead()
+    {
+        var snapshotA = Snapshot() with { MachineName = "authorized-a" };
+        var snapshotB = Snapshot() with { MachineName = "unauthorized-b" };
+        var transactionA = Transaction(OwnerA) with { Snapshot = snapshotA };
+        var transactionB = Transaction(OwnerB) with { Snapshot = snapshotB };
+        var journal = new SequencedJournal(transactionA, transactionB);
+        var network = new Network();
+        var engine = new Engine();
+        var controller = new ConnectionController(network, journal, engine);
+
+        var result = await controller.RollbackAuthorizedAsync(
+            Caller(OwnerA), "authorized restart cleanup", CancellationToken.None);
+
+        Assert.Equal(SessionAuthorizationDecision.OwnerAuthorized, result.Decision);
+        Assert.Equal(1, journal.Reads);
+        Assert.Equal(1, engine.Stops);
+        Assert.Same(snapshotA, Assert.Single(network.VerifiedSnapshots));
+        Assert.Equal(
+            new[] { ConnectionState.RollingBack, ConnectionState.Disconnected },
+            journal.Writes.Select(write => write.State));
+        Assert.All(journal.Writes, write => Assert.Equal(transactionA.SessionId, write.SessionId));
+        Assert.Equal(transactionA.SessionId, Assert.Single(journal.ClearedSessionIds));
+        Assert.DoesNotContain(journal.Writes, write => write.SessionId == transactionB.SessionId);
+    }
+
+    [Fact]
+    public async Task ForeignCallerIsDeniedStatusAndDisconnectWithZeroSideEffects()
+    {
+        var network = new Network();
+        var journal = new Journal();
+        var engine = new Engine();
+        var controller = Controller(network, journal, engine);
+        var created = await controller.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+        var foreignCaller = Caller(OwnerB, administrator: false);
+
+        var statusAuth = await controller.GetStatusAuthorizedAsync(foreignCaller, CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.ForeignOwnerDenied, statusAuth.Decision);
+        Assert.Equal(ConnectionState.SnapshotCommitted, statusAuth.State);
+
+        var rollbackAuth = await controller.RollbackAuthorizedAsync(foreignCaller, "foreign attempt", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.ForeignOwnerDenied, rollbackAuth.Decision);
+
+        Assert.Single(journal.Writes);
+        Assert.Same(created, journal.Active);
+        Assert.Equal(0, engine.Stops);
+        Assert.Equal(0, journal.Clears);
+        Assert.Equal(ConnectionState.SnapshotCommitted, controller.State);
+    }
+
+    [Fact]
+    public async Task LegacyOwnerDeniedForOrdinaryCallerAndOverrideForAdmin()
+    {
+        var legacyTx = Transaction(ownerSid: null) with { State = ConnectionState.SnapshotCommitted };
+        var journal = new Journal { Active = legacyTx };
+        var engine = new Engine();
+        var controller = Controller(new Network(), journal, engine);
+
+        var ordinaryCaller = Caller(OwnerA, administrator: false);
+        var adminCaller = Caller(OwnerB, administrator: true);
+
+        var ordinaryStatus = await controller.GetStatusAuthorizedAsync(ordinaryCaller, CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.LegacyOwnerDenied, ordinaryStatus.Decision);
+
+        var ordinaryRollback = await controller.RollbackAuthorizedAsync(ordinaryCaller, "ordinary attempt", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.LegacyOwnerDenied, ordinaryRollback.Decision);
+        Assert.Empty(journal.Writes);
+        Assert.Equal(0, engine.Stops);
+        Assert.Equal(0, journal.Clears);
+
+        var adminStatus = await controller.GetStatusAuthorizedAsync(adminCaller, CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OperationalOverrideAuthorized, adminStatus.Decision);
+        Assert.Equal(ConnectionState.SnapshotCommitted, adminStatus.State);
+
+        var adminRollback = await controller.RollbackAuthorizedAsync(adminCaller, "admin cleanup", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OperationalOverrideAuthorized, adminRollback.Decision);
+        Assert.Equal(1, engine.Stops);
+        Assert.Equal(1, journal.Clears);
+
+        Assert.Equal(2, journal.Writes.Count);
+        Assert.All(journal.Writes, write => Assert.Null(write.OwnerSid));
+    }
+
+    [Fact]
+    public async Task InvalidOwnerDeniedForOrdinaryCallerAndOverrideForAdminPreservingInvalidSidText()
+    {
+        const string invalidOwnerSid = "not-a-valid-sid";
+        var invalidTx = Transaction(invalidOwnerSid) with { State = ConnectionState.Connected };
+        var journal = new Journal { Active = invalidTx };
+        var engine = new Engine();
+        var controller = Controller(new Network(), journal, engine);
+
+        var ordinaryCaller = Caller(OwnerA, administrator: false);
+        var adminCaller = Caller(OwnerB, administrator: true);
+
+        var ordinaryStatus = await controller.GetStatusAuthorizedAsync(ordinaryCaller, CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.InvalidOwnerDenied, ordinaryStatus.Decision);
+
+        var ordinaryRollback = await controller.RollbackAuthorizedAsync(ordinaryCaller, "ordinary invalid attempt", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.InvalidOwnerDenied, ordinaryRollback.Decision);
+        Assert.Empty(journal.Writes);
+        Assert.Equal(0, engine.Stops);
+
+        var adminRollback = await controller.RollbackAuthorizedAsync(adminCaller, "admin cleanup invalid", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OperationalOverrideAuthorized, adminRollback.Decision);
+        Assert.Equal(1, engine.Stops);
+        Assert.Equal(1, journal.Clears);
+
+        Assert.Equal(2, journal.Writes.Count);
+        Assert.All(journal.Writes, write => Assert.Equal(invalidOwnerSid, write.OwnerSid));
+    }
+
+    [Fact]
+    public async Task LocalSystemOverrideCanInspectAndCleanupForeignSession()
+    {
+        var network = new Network();
+        var journal = new Journal();
+        var engine = new Engine();
+        var controller = Controller(network, journal, engine);
+        await controller.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+
+        var systemCaller = Caller("S-1-5-18", localSystem: true);
+
+        var status = await controller.GetStatusAuthorizedAsync(systemCaller, CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OperationalOverrideAuthorized, status.Decision);
+
+        var rollback = await controller.RollbackAuthorizedAsync(systemCaller, "system override", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.OperationalOverrideAuthorized, rollback.Decision);
+        Assert.Equal(1, engine.Stops);
+        Assert.Equal(1, journal.Clears);
+    }
+
+    [Fact]
+    public async Task ActiveAndJournalDisagreementFailsClosed()
+    {
+        // Case A: Active present but journal is null
+        var networkA = new Network();
+        var journalA = new Journal();
+        var controllerA = Controller(networkA, journalA);
+        await controllerA.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+        journalA.Active = null;
+
+        var statusA = await controllerA.GetStatusAuthorizedAsync(Caller(OwnerA), CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.InconsistentStateDenied, statusA.Decision);
+
+        var rollbackA = await controllerA.RollbackAuthorizedAsync(Caller(OwnerA), "test", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.InconsistentStateDenied, rollbackA.Decision);
+
+        // Case B: SessionId mismatch
+        var networkB = new Network();
+        var journalB = new Journal();
+        var controllerB = Controller(networkB, journalB);
+        await controllerB.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+        journalB.Active = Transaction(OwnerA);
+
+        var statusB = await controllerB.GetStatusAuthorizedAsync(Caller(OwnerA), CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.InconsistentStateDenied, statusB.Decision);
+
+        var rollbackB = await controllerB.RollbackAuthorizedAsync(Caller(OwnerA), "test", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.InconsistentStateDenied, rollbackB.Decision);
+
+        // Case C: OwnerSid mismatch
+        var networkC = new Network();
+        var journalC = new Journal();
+        var controllerC = Controller(networkC, journalC);
+        var txC = await controllerC.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+        journalC.Active = txC with { OwnerSid = OwnerB };
+
+        var statusC = await controllerC.GetStatusAuthorizedAsync(Caller(OwnerA), CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.InconsistentStateDenied, statusC.Decision);
+
+        var rollbackC = await controllerC.RollbackAuthorizedAsync(Caller(OwnerA), "test", CancellationToken.None);
+        Assert.Equal(SessionAuthorizationDecision.InconsistentStateDenied, rollbackC.Decision);
+    }
+
+    [Fact]
+    public async Task AtomicDisconnectHoldsLockAndSecondDisconnectWaitsForCleanCompletion()
+    {
+        var network = new Network();
+        var journal = new Journal();
+        var engine = new Engine();
+        var controller = Controller(network, journal, engine);
+        await controller.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+
+        var caller = Caller(OwnerA);
+        var rollback1Task = controller.RollbackAuthorizedAsync(caller, "first", CancellationToken.None);
+        var rollback2Task = controller.RollbackAuthorizedAsync(caller, "second", CancellationToken.None);
+
+        var results = await Task.WhenAll(rollback1Task, rollback2Task);
+
+        Assert.Contains(results, r => r.Decision == SessionAuthorizationDecision.OwnerAuthorized);
+        Assert.Contains(results, r => r.Decision == SessionAuthorizationDecision.NoActiveSession);
+        Assert.Equal(1, engine.Stops);
+        Assert.Equal(1, journal.Clears);
+        Assert.Equal(ConnectionState.Disconnected, controller.State);
+    }
+
+    [Fact]
+    public async Task ConcurrentConnectAndForeignDisconnectLeavesWinningSessionIntact()
+    {
+        var journal = new Journal();
+        var network = new Network();
+        var engine = new Engine();
+        var controller = Controller(network, journal, engine);
+
+        var connectTask = controller.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+        var foreignDisconnectTask = controller.RollbackAuthorizedAsync(Caller(OwnerB), "attack disconnect", CancellationToken.None);
+
+        await Task.WhenAll(connectTask, foreignDisconnectTask);
+
+        var connectTx = await connectTask;
+        var disconnectResult = await foreignDisconnectTask;
+
+        Assert.NotNull(connectTx);
+        Assert.Equal(OwnerA, connectTx.OwnerSid);
+        Assert.True(
+            disconnectResult.Decision == SessionAuthorizationDecision.NoActiveSession ||
+            disconnectResult.Decision == SessionAuthorizationDecision.ForeignOwnerDenied);
+
+        if (disconnectResult.Decision == SessionAuthorizationDecision.ForeignOwnerDenied)
+        {
+            Assert.Same(connectTx, journal.Active);
+            Assert.Equal(ConnectionState.SnapshotCommitted, controller.State);
+            Assert.Equal(0, engine.Stops);
+        }
+    }
+
+    [Fact]
     public void OwnershipSurfaceRemainsInternalAndIsolated()
     {
         Assert.DoesNotContain(
@@ -235,6 +571,8 @@ public sealed class SessionOwnershipTests
         Assert.DoesNotContain("OwnerSid", ledger, StringComparison.Ordinal);
         Assert.DoesNotContain("Restoration.Windows", serviceProject, StringComparison.Ordinal);
         Assert.DoesNotContain("Recovery", commands, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Restoration", commands, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(4, Enum.GetValues<ControlCommand>().Length);
         foreach (var forbidden in new[]
                  {
                      "ControlledRecoveryApproval", "ControlledRecoveryRestorationWorkflow",
@@ -244,6 +582,14 @@ public sealed class SessionOwnershipTests
             Assert.DoesNotContain(forbidden, serviceSources, StringComparison.Ordinal);
     }
 
+    private static ControlCallerIdentity Caller(
+        string sid,
+        bool authenticated = true,
+        bool administrator = false,
+        bool network = false,
+        bool localSystem = false)
+        => new(sid, Array.Empty<string>(), authenticated, administrator, network, localSystem);
+
     private static async Task<(NetworkTransaction? Transaction, Exception? Exception)> Capture(
         Func<Task<NetworkTransaction>> action)
     {
@@ -251,7 +597,7 @@ public sealed class SessionOwnershipTests
         catch (Exception exception) { return (null, exception); }
     }
 
-    private static ConnectionController Controller(Network network, Journal journal, Engine? engine = null)
+    private static ConnectionController Controller(Network network, ITransactionJournal journal, Engine? engine = null)
         => new(network, journal, engine ?? new Engine());
 
     private static NetworkTransaction Transaction(string? ownerSid)
@@ -284,6 +630,7 @@ public sealed class SessionOwnershipTests
     private sealed class Network : INetworkStateManager
     {
         public int Captures { get; private set; }
+        public List<NetworkStateSnapshot> VerifiedSnapshots { get; } = new();
         public Exception? CaptureException { get; init; }
         public Task<NetworkStateSnapshot> CaptureStateAsync(CancellationToken cancellationToken)
         {
@@ -293,7 +640,37 @@ public sealed class SessionOwnershipTests
             return Task.FromResult(Snapshot());
         }
         public Task VerifyRestorationAsync(NetworkStateSnapshot original, CancellationToken cancellationToken)
-            => Task.CompletedTask;
+        {
+            VerifiedSnapshots.Add(original);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class SequencedJournal(params NetworkTransaction?[] reads) : ITransactionJournal
+    {
+        private readonly Queue<NetworkTransaction?> _reads = new(reads);
+        public int Reads { get; private set; }
+        public List<NetworkTransaction> Writes { get; } = new();
+        public List<Guid> ClearedSessionIds { get; } = new();
+        public string JournalPath => "sequenced-test";
+
+        public Task<NetworkTransaction?> ReadActiveAsync(CancellationToken cancellationToken)
+        {
+            Reads++;
+            return Task.FromResult(_reads.Count > 0 ? _reads.Dequeue() : null);
+        }
+
+        public Task WriteAsync(NetworkTransaction transaction, CancellationToken cancellationToken)
+        {
+            Writes.Add(transaction);
+            return Task.CompletedTask;
+        }
+
+        public Task ClearAsync(Guid expectedSessionId, CancellationToken cancellationToken)
+        {
+            ClearedSessionIds.Add(expectedSessionId);
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class Journal : ITransactionJournal
@@ -301,6 +678,7 @@ public sealed class SessionOwnershipTests
         public NetworkTransaction? Active { get; set; }
         public List<NetworkTransaction> Writes { get; } = new();
         public int WriteAttempts { get; private set; }
+        public int Clears { get; private set; }
         public Exception? WriteException { get; init; }
         public Func<NetworkTransaction, Task>? OnWrite { get; init; }
         public string JournalPath => "controlled-test";
@@ -316,6 +694,7 @@ public sealed class SessionOwnershipTests
             => Task.FromResult(Active);
         public Task ClearAsync(Guid expectedSessionId, CancellationToken cancellationToken)
         {
+            Clears++;
             Assert.Equal(expectedSessionId, Active?.SessionId);
             Active = null;
             return Task.CompletedTask;
