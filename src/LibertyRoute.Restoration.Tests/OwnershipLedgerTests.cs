@@ -516,14 +516,17 @@ public sealed class OwnershipLedgerTests : IAsyncLifetime
         var allowedPropertyTypes = new[]
         {
             typeof(Guid),
+            typeof(Guid?),
             typeof(string),
             typeof(bool),
             typeof(int),
             typeof(int?),
             typeof(DateTimeOffset),
+            typeof(DateTimeOffset?),
             typeof(DryRunOperationCategory),
             typeof(OwnershipEvidenceSource),
-            typeof(OwnedChangeLifecycle)
+            typeof(OwnedChangeLifecycle),
+            typeof(RecordPurpose)
         };
 
         var properties = typeof(PersistedOwnedChange).GetProperties();
@@ -534,6 +537,81 @@ public sealed class OwnershipLedgerTests : IAsyncLifetime
             Assert.DoesNotContain(forbiddenNameParts, part => name.Contains(part, StringComparison.Ordinal));
             Assert.Contains(property.PropertyType, allowedPropertyTypes);
         }
+    }
+
+    [Fact]
+    public async Task ProvenanceAdversarialCasesFailClosed()
+    {
+        var legacyRecord = Record(sessionId: SessionA, lifecycle: OwnedChangeLifecycle.Applied);
+        var legacyEnvelope = JsonSerializer.Serialize(new[] { legacyRecord }, RawJsonOptions);
+        var checksum = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(legacyEnvelope)));
+        await File.WriteAllTextAsync(Path.Combine(_root, $"{SessionA:N}.lrw"), JsonSerializer.Serialize(new RawEnvelope(legacyEnvelope, checksum), RawJsonOptions));
+
+        var ledger = NewLedger();
+        var readLegacy = await ledger.ReadForSessionAsync(SessionA, CancellationToken.None);
+        Assert.Equal(RecordPurpose.SessionMutation, readLegacy.Single().Purpose);
+
+        var sessionMutationWithRecovery = PersistedOwnedChange.TryCreate(
+            SessionA,
+            Guid.NewGuid(),
+            DryRunOperationCategory.Route,
+            "route-10.0.0.0/24",
+            "original",
+            "applied",
+            DateTimeOffset.UtcNow,
+            1,
+            OwnershipEvidenceSource.MutationLedger,
+            OwnedChangeLifecycle.Applied,
+            RecordPurpose.SessionMutation,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            out _,
+            out var failureSession);
+        Assert.False(sessionMutationWithRecovery);
+        Assert.Contains("Session mutation provenance", failureSession, StringComparison.OrdinalIgnoreCase);
+
+        var missingAttempt = PersistedOwnedChange.TryCreate(
+            SessionA,
+            Guid.NewGuid(),
+            DryRunOperationCategory.Route,
+            "route-10.0.0.0/24",
+            "original",
+            "applied",
+            DateTimeOffset.UtcNow,
+            2,
+            OwnershipEvidenceSource.MutationLedger,
+            OwnedChangeLifecycle.Applied,
+            RecordPurpose.RecoveryMutation,
+            null,
+            Guid.NewGuid(),
+            out _,
+            out var failureAttempt);
+        Assert.False(missingAttempt);
+        Assert.Contains("RecoveryAttemptId", failureAttempt, StringComparison.OrdinalIgnoreCase);
+
+        var missingEvidence = PersistedOwnedChange.TryCreate(
+            SessionA,
+            Guid.NewGuid(),
+            DryRunOperationCategory.Route,
+            "route-10.0.0.0/24",
+            "original",
+            "applied",
+            DateTimeOffset.UtcNow,
+            3,
+            OwnershipEvidenceSource.MutationLedger,
+            OwnedChangeLifecycle.Applied,
+            RecordPurpose.RecoveryMutation,
+            Guid.NewGuid(),
+            null,
+            out _,
+            out var failureEvidence);
+        Assert.False(missingEvidence);
+        Assert.Contains("AuthorizationEvidenceId", failureEvidence, StringComparison.OrdinalIgnoreCase);
+
+        var unknownEnum = JsonSerializer.Deserialize<PersistedOwnedChange>("{\"sessionId\":\"11111111-1111-1111-1111-111111111111\",\"changeId\":\"22222222-2222-2222-2222-222222222222\",\"category\":1,\"targetIdentity\":\"route\",\"originalValue\":\"before\",\"appliedValue\":\"after\",\"recordedAtUtc\":\"2026-08-26T00:00:00Z\",\"sequenceNumber\":1,\"evidenceSource\":1,\"lifecycle\":1,\"isComplete\":true,\"purpose\":9999}", RawJsonOptions);
+        Assert.NotNull(unknownEnum);
+        var validationFailure = PersistedOwnedChange.Validate(unknownEnum!);
+        Assert.Contains("purpose", validationFailure, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

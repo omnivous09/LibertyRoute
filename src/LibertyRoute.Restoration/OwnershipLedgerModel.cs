@@ -1,5 +1,11 @@
 namespace LibertyRoute.Restoration;
 
+public enum RecordPurpose
+{
+    SessionMutation,
+    RecoveryMutation
+}
+
 /// <summary>
 /// Lifecycle of a LibertyRoute-owned change recorded in the ownership ledger.
 /// The lifecycle may only advance forward: Planned to Applied to Reverted.
@@ -66,8 +72,17 @@ public sealed record PersistedOwnedChange(
     int? SequenceNumber,
     OwnershipEvidenceSource EvidenceSource,
     OwnedChangeLifecycle Lifecycle,
-    bool IsComplete)
+    bool IsComplete,
+    RecordPurpose Purpose = RecordPurpose.SessionMutation,
+    Guid? RecoveryAttemptId = null,
+    Guid? AuthorizationEvidenceId = null)
 {
+    public bool IsRecoveryMutation => Purpose == RecordPurpose.RecoveryMutation;
+    public bool HasRecoveryProvenance => Purpose == RecordPurpose.RecoveryMutation && RecoveryAttemptId.HasValue && AuthorizationEvidenceId.HasValue;
+
+    public Guid DeriveOwnershipChangeId(string operationIdentity)
+        => MutationOwnershipCoordinator.DeriveChangeId(SessionId, operationIdentity);
+
     public static PersistedOwnedChange Create(
         Guid sessionId,
         Guid changeId,
@@ -78,7 +93,10 @@ public sealed record PersistedOwnedChange(
         DateTimeOffset recordedAtUtc,
         int? sequenceNumber,
         OwnershipEvidenceSource evidenceSource,
-        OwnedChangeLifecycle lifecycle)
+        OwnedChangeLifecycle lifecycle,
+        RecordPurpose purpose = RecordPurpose.SessionMutation,
+        Guid? recoveryAttemptId = null,
+        Guid? authorizationEvidenceId = null)
     {
         if (!TryCreate(
                 sessionId,
@@ -91,6 +109,9 @@ public sealed record PersistedOwnedChange(
                 sequenceNumber,
                 evidenceSource,
                 lifecycle,
+                purpose,
+                recoveryAttemptId,
+                authorizationEvidenceId,
                 out var record,
                 out var failureReason))
         {
@@ -113,6 +134,39 @@ public sealed record PersistedOwnedChange(
         OwnedChangeLifecycle lifecycle,
         out PersistedOwnedChange? record,
         out string failureReason)
+        => TryCreate(
+            sessionId,
+            changeId,
+            category,
+            targetIdentity,
+            originalValue,
+            appliedValue,
+            recordedAtUtc,
+            sequenceNumber,
+            evidenceSource,
+            lifecycle,
+            RecordPurpose.SessionMutation,
+            null,
+            null,
+            out record,
+            out failureReason);
+
+    public static bool TryCreate(
+        Guid sessionId,
+        Guid changeId,
+        DryRunOperationCategory category,
+        string targetIdentity,
+        string originalValue,
+        string appliedValue,
+        DateTimeOffset recordedAtUtc,
+        int? sequenceNumber,
+        OwnershipEvidenceSource evidenceSource,
+        OwnedChangeLifecycle lifecycle,
+        RecordPurpose purpose,
+        Guid? recoveryAttemptId,
+        Guid? authorizationEvidenceId,
+        out PersistedOwnedChange? record,
+        out string failureReason)
     {
         record = null;
         failureReason = ValidateComponents(
@@ -126,7 +180,10 @@ public sealed record PersistedOwnedChange(
             sequenceNumber,
             evidenceSource,
             lifecycle,
-            isComplete: null);
+            isComplete: null,
+            purpose,
+            recoveryAttemptId,
+            authorizationEvidenceId);
         if (!string.IsNullOrEmpty(failureReason))
             return false;
 
@@ -141,7 +198,10 @@ public sealed record PersistedOwnedChange(
             sequenceNumber,
             evidenceSource,
             lifecycle,
-            lifecycle == OwnedChangeLifecycle.Applied);
+            lifecycle == OwnedChangeLifecycle.Applied,
+            purpose,
+            recoveryAttemptId,
+            authorizationEvidenceId);
         failureReason = string.Empty;
         return true;
     }
@@ -164,7 +224,10 @@ public sealed record PersistedOwnedChange(
             record.SequenceNumber,
             record.EvidenceSource,
             record.Lifecycle,
-            record.IsComplete);
+            record.IsComplete,
+            record.Purpose,
+            record.RecoveryAttemptId,
+            record.AuthorizationEvidenceId);
     }
 
     /// <summary>
@@ -220,7 +283,10 @@ public sealed record PersistedOwnedChange(
         int? sequenceNumber,
         OwnershipEvidenceSource evidenceSource,
         OwnedChangeLifecycle lifecycle,
-        bool? isComplete)
+        bool? isComplete,
+        RecordPurpose purpose,
+        Guid? recoveryAttemptId,
+        Guid? authorizationEvidenceId)
     {
         if (sessionId == Guid.Empty)
             return "Session id is required.";
@@ -242,6 +308,22 @@ public sealed record PersistedOwnedChange(
             return "Evidence source is invalid.";
         if (!Enum.IsDefined(lifecycle))
             return "Lifecycle is invalid.";
+        if (!Enum.IsDefined(purpose))
+            return "Ownership record purpose is invalid.";
+        if (purpose == RecordPurpose.SessionMutation)
+        {
+            if (recoveryAttemptId.HasValue && recoveryAttemptId.Value != Guid.Empty)
+                return "Session mutation provenance must not include a recovery attempt id.";
+            if (authorizationEvidenceId.HasValue && authorizationEvidenceId.Value != Guid.Empty)
+                return "Session mutation provenance must not include an authorization evidence id.";
+        }
+        else
+        {
+            if (!recoveryAttemptId.HasValue || recoveryAttemptId.Value == Guid.Empty)
+                return "Recovery mutation provenance requires a non-empty RecoveryAttemptId.";
+            if (!authorizationEvidenceId.HasValue || authorizationEvidenceId.Value == Guid.Empty)
+                return "Recovery mutation provenance requires a non-empty AuthorizationEvidenceId.";
+        }
         if (isComplete.HasValue && isComplete.Value != (lifecycle == OwnedChangeLifecycle.Applied))
             return "Completeness must reflect the current lifecycle: only Applied changes are complete.";
         return string.Empty;

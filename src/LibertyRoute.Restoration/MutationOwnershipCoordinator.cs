@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
-using System.Text;
+using LibertyRoute.Core;
 
 namespace LibertyRoute.Restoration;
 
@@ -111,11 +110,7 @@ public sealed class MutationOwnershipCoordinator
     /// ChangeId and the ledger lifecycle rules make retries idempotent.
     /// </summary>
     public static Guid DeriveChangeId(Guid sessionId, string operationIdentity)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(operationIdentity);
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(sessionId.ToString("D") + "\n" + operationIdentity));
-        return new Guid(hash.AsSpan(0, 16));
-    }
+        => OwnershipIdentity.DeriveChangeId(sessionId, operationIdentity);
 
     public async Task<RecordedMutationExecution> ExecuteAuthorizedMutationAsync(
         AuthorizedRestorationRequest request,
