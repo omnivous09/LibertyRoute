@@ -8,6 +8,10 @@ namespace LibertyRoute.Service;
 internal sealed class SecureControlPipeFactory
 {
     private const PipeAccessRights DuplexClientRights = PipeAccessRights.ReadWrite;
+    private const PipeAccessRights ServerInstanceRights =
+        DuplexClientRights | PipeAccessRights.CreateNewInstance;
+    internal const int MaximumActiveClients = 8;
+    internal const int MaximumPipeInstances = MaximumActiveClients + 1;
     private readonly SecurityIdentifier _serviceSid;
 
     internal SecureControlPipeFactory(SecurityIdentifier serviceSid)
@@ -34,21 +38,28 @@ internal sealed class SecureControlPipeFactory
         var interactiveSid = new SecurityIdentifier(WellKnownSidType.InteractiveSid, null);
 
         security.AddAccessRule(new PipeAccessRule(networkSid, DuplexClientRights, AccessControlType.Deny));
-        foreach (var allowedSid in new[] { _serviceSid, localSystemSid, administratorsSid, interactiveSid }.Distinct())
+        security.AddAccessRule(new PipeAccessRule(_serviceSid, ServerInstanceRights, AccessControlType.Allow));
+        foreach (var allowedSid in new[] { localSystemSid, administratorsSid, interactiveSid }
+                     .Distinct()
+                     .Where(sid => !sid.Equals(_serviceSid)))
             security.AddAccessRule(new PipeAccessRule(allowedSid, DuplexClientRights, AccessControlType.Allow));
 
         return security;
     }
 
     internal NamedPipeServerStream Create(string pipeName)
+        => Create(pipeName, firstInstance: true);
+
+    internal NamedPipeServerStream Create(string pipeName, bool firstInstance)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(pipeName);
         return NamedPipeServerStreamAcl.Create(
             pipeName,
             PipeDirection.InOut,
-            1,
+            MaximumPipeInstances,
             PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance,
+            PipeOptions.Asynchronous |
+                (firstInstance ? PipeOptions.FirstPipeInstance : PipeOptions.None),
             ControlProtocolConstants.MaximumRequestSize,
             ControlProtocolConstants.MaximumResponseSize,
             CreateSecurity(),

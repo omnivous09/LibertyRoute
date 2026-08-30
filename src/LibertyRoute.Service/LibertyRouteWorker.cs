@@ -49,35 +49,22 @@ internal sealed class LibertyRouteWorker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            await using var pipe = CreateListener();
-            try
-            {
-                await pipe.WaitForConnectionAsync(stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception exception)
-            {
-                _logger.LogCritical(exception, "The secure control listener failed.");
-                throw;
-            }
-
-            try
-            {
-                await _handler.HandleAsync(pipe, stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception exception)
-            {
-                _logger.LogError(exception, "Secure control client handling failed.");
-            }
+            var server = new BoundedControlPipeServer(
+                PipeName,
+                _pipeFactory,
+                _handler,
+                _logger);
+            await server.RunAsync(stoppingToken);
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            _logger.LogCritical(exception, "The secure control listener failed.");
+            throw;
         }
     }
 
@@ -95,16 +82,4 @@ internal sealed class LibertyRouteWorker : BackgroundService
         await base.StopAsync(cancellationToken);
     }
 
-    private System.IO.Pipes.NamedPipeServerStream CreateListener()
-    {
-        try
-        {
-            return _pipeFactory.Create(PipeName);
-        }
-        catch (Exception exception)
-        {
-            _logger.LogCritical(exception, "The secure control listener could not be created.");
-            throw;
-        }
-    }
 }

@@ -541,6 +541,41 @@ public sealed class ControlPipeSecurityTests
     }
 
     [Fact]
+    public async Task InitialAndSubsequentInstancesPreserveSecureBoundedTopology()
+    {
+        using var current = WindowsIdentity.GetCurrent(TokenAccessLevels.Query);
+        var pipeName = $"LibertyRoute.SecurityTest.{Guid.NewGuid():N}";
+        var serviceSid = current.User!;
+        var factory = new SecureControlPipeFactory(serviceSid);
+
+        await using var initial = factory.Create(pipeName, firstInstance: true);
+        await using var subsequent = factory.Create(pipeName, firstInstance: false);
+        NamedPipeServerStream? prohibitedSecondFirst = null;
+        var failure = Record.Exception(() =>
+            prohibitedSecondFirst = factory.Create(pipeName, firstInstance: true));
+
+        Assert.Null(prohibitedSecondFirst);
+        Assert.True(failure is IOException or UnauthorizedAccessException);
+        Assert.Equal(8, SecureControlPipeFactory.MaximumActiveClients);
+        Assert.Equal(9, SecureControlPipeFactory.MaximumPipeInstances);
+
+        var security = factory.CreateSecurity();
+        var rules = security.GetAccessRules(true, false, typeof(SecurityIdentifier))
+            .Cast<PipeAccessRule>()
+            .ToArray();
+        Assert.True(security.AreAccessRulesProtected);
+        AssertRule(rules, WellKnownSidType.NetworkSid, AccessControlType.Deny);
+        AssertRule(rules, WellKnownSidType.InteractiveSid, AccessControlType.Allow);
+        Assert.Contains(rules, rule =>
+            ((SecurityIdentifier)rule.IdentityReference).Equals(serviceSid) &&
+            rule.AccessControlType == AccessControlType.Allow &&
+            (rule.PipeAccessRights & PipeAccessRights.CreateNewInstance) != 0);
+        Assert.DoesNotContain(rules, rule =>
+            !((SecurityIdentifier)rule.IdentityReference).Equals(serviceSid) &&
+            (rule.PipeAccessRights & PipeAccessRights.CreateNewInstance) != 0);
+    }
+
+    [Fact]
     public async Task NetworkCallerIsRejectedBeforeGreetingReadOrDispatchDespiteAllowConditions()
     {
         var dispatcher = new FakeDispatcher();
