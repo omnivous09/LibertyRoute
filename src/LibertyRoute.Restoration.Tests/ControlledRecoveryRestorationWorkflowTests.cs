@@ -302,7 +302,7 @@ public sealed class ControlledRecoveryRestorationWorkflowTests
         var result = await Workflow(journal, network, new Ledger(Applied(session)), executorFactory: executorFactory)
             .ExecuteAsync(new(session), CancellationToken.None);
         Assert.Equal(RecoveryRestorationWorkflowStatus.ActivationDenied, result.Status);
-        Assert.Equal(ControlledRestorationActivationStatus.DeniedTriggerUnavailable, result.ActivationStatus);
+        Assert.Null(result.ActivationStatus);
         Assert.Equal(0, executorFactory.Count);
         Assert.Equal(0, journal.WriteCount);
         Assert.Equal(0, journal.ClearCount);
@@ -310,7 +310,7 @@ public sealed class ControlledRecoveryRestorationWorkflowTests
     }
 
     [Fact]
-    public async Task ControlledChainPreservesExactPhase4EResultAndUsesFreshTransactionMetadata()
+    public async Task LegacyWorkflowConstructionCannotReachExecutableRecoveryBoundary()
     {
         var session = Guid.NewGuid();
         var expected = new RestorationBatchExecution(RestorationBatchExecutionStatus.CancelledAfterPartialExecution,
@@ -321,17 +321,22 @@ public sealed class ControlledRecoveryRestorationWorkflowTests
         var provider = new Provider();
         var providerFactory = new ProviderFactory(provider);
         var executors = new ExecutorFactory();
-        var result = await Workflow(new Journal { Active = Transaction(session) }, new Network(Snapshot()), new Ledger(),
-                new ControlledRestorationActivationAuthority(new Trigger()), providerFactory, executors, orchestrator)
+        var trigger = new Trigger();
+        var bindCount = 0;
+        var workflow = new ControlledRecoveryRestorationWorkflow(
+            new Journal { Active = Transaction(session) }, new Network(Snapshot()), orchestrator, executors,
+            new ControlledRestorationActivationAuthority(trigger), providerFactory, _ => bindCount++);
+        var result = await workflow
             .ExecuteAsync(new(session), CancellationToken.None);
-        Assert.Equal(RecoveryRestorationWorkflowStatus.ExecutionReturned, result.Status);
-        Assert.Same(expected, result.Execution!.BatchExecution);
-        Assert.True(result.Execution.BatchExecution!.RequiresManualRecovery);
+        Assert.Equal(RecoveryRestorationWorkflowStatus.ActivationDenied, result.Status);
+        Assert.Null(result.Execution);
         Assert.NotEqual(Guid.Empty, Assert.Single(orchestrator.TransactionIds));
-        Assert.Equal(1, providerFactory.Count);
-        Assert.Equal(1, executors.Count);
+        Assert.Equal(0, providerFactory.Count);
+        Assert.Equal(0, executors.Count);
         Assert.Equal(0, provider.Calls);
-        Assert.Equal(0, Assert.Single(executors.Executors).RevertedCount);
+        Assert.Empty(executors.Executors);
+        Assert.Equal(0, bindCount);
+        Assert.Equal(0, trigger.Count);
     }
 
     [Fact]
@@ -340,6 +345,7 @@ public sealed class ControlledRecoveryRestorationWorkflowTests
         var session = Guid.NewGuid();
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var capture = 0;
         var network = new Network(Snapshot(), async () =>
         {
@@ -348,19 +354,37 @@ public sealed class ControlledRecoveryRestorationWorkflowTests
                 entered.SetResult();
                 await release.Task;
             }
+            else
+            {
+                secondEntered.TrySetResult();
+            }
         });
         var journal = new Journal { Active = Transaction(session) };
-        var firstWorkflow = Workflow(journal, network, new Ledger(Applied(session)));
-        var secondWorkflow = Workflow(journal, network, new Ledger(Applied(session)));
+        var firstTrigger = new Trigger();
+        var secondTrigger = new Trigger();
+        var firstFactory = new ProviderFactory(new Provider());
+        var secondFactory = new ProviderFactory(new Provider());
+        var firstWorkflow = Workflow(journal, network, new Ledger(Applied(session)),
+            new ControlledRestorationActivationAuthority(firstTrigger), firstFactory);
+        var secondWorkflow = Workflow(journal, network, new Ledger(Applied(session)),
+            new ControlledRestorationActivationAuthority(secondTrigger), secondFactory);
         var first = firstWorkflow.ExecuteAsync(new(session), CancellationToken.None);
         await entered.Task;
         var second = secondWorkflow.ExecuteAsync(new(session), CancellationToken.None);
-        await Task.Delay(50);
+        Assert.False(secondEntered.Task.IsCompleted);
+        Assert.False(second.IsCompleted);
         Assert.Equal(1, network.CaptureCount);
+        Assert.Equal(1, journal.ReadCount);
+        Assert.Equal(0, secondTrigger.Count);
+        Assert.Equal(0, secondFactory.Count);
         release.SetResult();
         var results = await Task.WhenAll(first, second);
+        Assert.True(secondEntered.Task.IsCompleted);
         Assert.All(results, result => Assert.Equal(RecoveryRestorationWorkflowStatus.ActivationDenied, result.Status));
         Assert.Equal(2, network.CaptureCount);
+        Assert.Equal(0, firstFactory.Count);
+        Assert.Equal(0, secondFactory.Count);
+        Assert.True(journal.ReadCount >= 6);
     }
 
     [Fact]

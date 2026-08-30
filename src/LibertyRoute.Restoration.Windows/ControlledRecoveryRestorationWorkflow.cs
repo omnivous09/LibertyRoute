@@ -43,7 +43,10 @@ internal sealed record RecoveryRestorationWorkflowResult(
     IReadOnlyList<string> BlockingReasons,
     ControlledRestorationActivationStatus? ActivationStatus,
     ControlledRestorationExecutionResult? Execution,
-    string Reason);
+    string Reason)
+{
+    internal RecoveryExecutionResult? RecoveryExecution { get; init; }
+}
 
 /// <summary>
 /// Internal, unregistered recovery integration workflow. It reconstructs a dry-run
@@ -67,6 +70,8 @@ internal sealed class ControlledRecoveryRestorationWorkflow
     private readonly IControlledRestorationActivationAuthority _authority;
     private readonly IRestorationMutationProviderFactory _providerFactory;
     private readonly Action<RestorationOrchestrationPreparation>? _bindApprovedPreparation;
+    private readonly IConditionalOwnershipLedger? _conditionalLedger;
+    private readonly IRecoveryBaselineVerifier? _baselineVerifier;
 
     internal ControlledRecoveryRestorationWorkflow(
         ITransactionJournal journal,
@@ -99,6 +104,21 @@ internal sealed class ControlledRecoveryRestorationWorkflow
         _authority = authority ?? throw new ArgumentNullException(nameof(authority));
         _providerFactory = providerFactory ?? throw new ArgumentNullException(nameof(providerFactory));
         _bindApprovedPreparation = bindApprovedPreparation;
+    }
+
+    internal ControlledRecoveryRestorationWorkflow(
+        IRecoveryTransactionJournal journal,
+        IConditionalOwnershipLedger ledger,
+        INetworkStateManager network,
+        IRestorationExecutionOrchestrator orchestrator,
+        IRecordedMutationExecutorFactory executorFactory,
+        IControlledRestorationActivationAuthority authority,
+        IRestorationMutationProviderFactory providerFactory,
+        Action<RestorationOrchestrationPreparation>? bindApprovedPreparation = null)
+        : this(journal, network, orchestrator, executorFactory, authority, providerFactory, bindApprovedPreparation)
+    {
+        _conditionalLedger = ledger ?? throw new ArgumentNullException(nameof(ledger));
+        _baselineVerifier = new RecoveryBaselineVerifier();
     }
 
     internal async Task<RecoveryRestorationWorkflowResult> ExecuteAsync(
@@ -144,7 +164,7 @@ internal sealed class ControlledRecoveryRestorationWorkflow
             var blockers = preparation.ExecutionPreparation.BlockingReasons;
             var operationCount = dryRun.Operations.Count;
             if (!preparation.ExecutionPreparation.CanExecuteAutomatically ||
-                preparation.ExecutionPreparation.AuthorizedRequests.Count == 0 ||
+                preparation.ExecutionPreparation.AuthorizedRequests.Count != 1 ||
                 preparation.ExecutionPreparation.RejectedOperations.Count != 0 ||
                 blockers.Count != 0)
             {
@@ -166,6 +186,14 @@ internal sealed class ControlledRecoveryRestorationWorkflow
             if (!marker.Equals(ControlledRecoveryJournalMarker.Create(currentJournal!)))
                 return Result(RecoveryRestorationWorkflowStatus.JournalChanged, request.SessionId, currentJournal?.State, "The active recovery journal changed before activation authorization.", operationCount);
 
+            if (_conditionalLedger is null || _journal is not IRecoveryTransactionJournal recoveryJournal)
+                return Result(
+                    RecoveryRestorationWorkflowStatus.ActivationDenied,
+                    journal.SessionId,
+                    journal.State,
+                    "Controlled recovery execution requires the durable conditional journal and ownership ledger.",
+                    operationCount);
+
             _bindApprovedPreparation?.Invoke(preparation);
             cancellationToken.ThrowIfCancellationRequested();
             var activation = await _authority.AuthorizeAsync(preparation, cancellationToken).ConfigureAwait(false);
@@ -185,20 +213,25 @@ internal sealed class ControlledRecoveryRestorationWorkflow
 
             using var grant = activation.Grant;
             cancellationToken.ThrowIfCancellationRequested();
-            var boundary = new ControlledWindowsRestorationExecutionBoundary(
-                _orchestrator,
-                _executorFactory,
-                new ControlledRestorationActivationHandoff(grant, _providerFactory));
-            var execution = await boundary.ExecuteAsync(preparation, cancellationToken).ConfigureAwait(false);
+            if (!ControlledRestorationPreparationFingerprint.TryCreate(preparation, out var preparationFingerprint, out var fingerprintFailure))
+                return Result(RecoveryRestorationWorkflowStatus.PreparationBlocked, journal.SessionId, journal.State, fingerprintFailure, operationCount);
+
+            var preflight = new ControlledRestorationActivationHandoff(grant, _providerFactory).Create(preparation, cancellationToken);
+            if (!preflight.IsEnabled || preflight.Provider is null)
+                return Result(RecoveryRestorationWorkflowStatus.ActivationDenied, journal.SessionId, journal.State, preflight.Reason, operationCount);
+
+            var versioned = await recoveryJournal.ReadActiveRecoveryAsync(cancellationToken).ConfigureAwait(false);
+            if (versioned is null || !marker.Equals(ControlledRecoveryJournalMarker.Create(versioned.Transaction)))
+                return Result(RecoveryRestorationWorkflowStatus.JournalChanged, journal.SessionId, journal.State, "The active recovery journal changed before durable intent.", operationCount);
+
+            var coordinator = new RecoveryExecutionCoordinator(recoveryJournal, _conditionalLedger, _network, _baselineVerifier!);
+            var recoveryExecution = await coordinator.ExecuteAsync(
+                versioned, preparation, preparation.ExecutionPreparation.AuthorizedRequests.Single(),
+                preparationFingerprint!, preflight.Provider, cancellationToken).ConfigureAwait(false);
             return new RecoveryRestorationWorkflowResult(
-                RecoveryRestorationWorkflowStatus.ExecutionReturned,
-                journal.SessionId,
-                journal.State,
-                operationCount,
-                blockers,
-                activation.Status,
-                execution,
-                execution.Reason);
+                RecoveryRestorationWorkflowStatus.ExecutionReturned, journal.SessionId, journal.State,
+                operationCount, blockers, activation.Status, null, recoveryExecution.Reason)
+            { RecoveryExecution = recoveryExecution };
         }
         finally
         {

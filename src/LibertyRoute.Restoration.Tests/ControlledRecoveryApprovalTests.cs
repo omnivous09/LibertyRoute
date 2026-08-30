@@ -308,58 +308,14 @@ public sealed class ControlledRecoveryApprovalTests
     }
 
     [Fact]
-    public async Task ControlledApprovedExecutionTraversesExactFakeChainOnce()
+    public void ControlledApprovedExecutionHasOnlyDurableD1bConstructionPath()
     {
-        var session = Guid.NewGuid();
-        var route = new RouteState
-        {
-            Destination = "10.0.0.0/24",
-            NextHop = "10.0.0.1",
-            InterfaceIndex = 4,
-            Metric = 1,
-            AddressFamily = "2"
-        };
-        var journal = new Journal
-        {
-            Active = Transaction(session) with
-            {
-                Snapshot = new NetworkStateSnapshot(DateTimeOffset.UnixEpoch, "test-machine", Array.Empty<AdapterState>(), new[] { route }, Array.Empty<DnsInterfaceState>())
-            }
-        };
-        var record = PersistedOwnedChange.Create(
-            session,
-            Guid.NewGuid(),
-            DryRunOperationCategory.Route,
-            "2|10.0.0.0|24",
-            "destination=10.0.0.0/24;nextHop=10.0.0.1;interfaceIndex=4;metric=1;addressFamily=2",
-            "<absent>",
-            DateTimeOffset.UnixEpoch.AddMinutes(2),
-            1,
-            OwnershipEvidenceSource.MutationLedger,
-            OwnedChangeLifecycle.Applied);
-        var approval = new ControlledRecoveryApprovalAuthority(journal);
-        var candidate = (await approval.QueryCandidateAsync(CancellationToken.None)).Candidate!;
-        using var ticket = (await approval.ApproveAsync(new(candidate.CandidateId, session), CancellationToken.None)).Ticket!;
-        var provider = new Provider();
-        var providerFactory = new ProviderFactory(provider);
-        var executorFactory = new ExecutorFactory();
-        var execution = new ControlledApprovedRecoveryExecution(
-            approval,
-            journal,
-            new Network(),
-            new RestorationExecutionOrchestrator(new Ledger(record)),
-            executorFactory,
-            providerFactory);
-
-        var result = await execution.ExecuteAsync(ticket, CancellationToken.None);
-
-        Assert.Equal(RecoveryRestorationWorkflowStatus.ExecutionReturned, result.Status);
-        Assert.Equal(ControlledRestorationExecutionStatus.ExecutionReturned, result.Execution!.Status);
-        Assert.Equal(RestorationBatchExecutionStatus.Completed, result.Execution.BatchExecution!.Status);
-        Assert.Equal(1, providerFactory.Calls);
-        Assert.Equal(1, executorFactory.Calls);
-        Assert.Equal(0, provider.Calls);
-        Assert.True(ticket.IsTerminal);
+        var constructor = Assert.Single(typeof(ControlledApprovedRecoveryExecution)
+            .GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic));
+        var parameters = constructor.GetParameters().Select(parameter => parameter.ParameterType).ToArray();
+        Assert.Contains(typeof(IRecoveryTransactionJournal), parameters);
+        Assert.Contains(typeof(IConditionalOwnershipLedger), parameters);
+        Assert.DoesNotContain(typeof(ITransactionJournal), parameters);
     }
 
     [Fact]

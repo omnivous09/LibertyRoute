@@ -268,15 +268,17 @@ internal sealed class ApprovedRecoveryActivationTrigger : IControlledRestoration
 internal sealed class ControlledApprovedRecoveryExecution
 {
     private readonly ControlledRecoveryApprovalAuthority _approvalAuthority;
-    private readonly ITransactionJournal _journal;
+    private readonly IRecoveryTransactionJournal _journal;
     private readonly INetworkStateManager _network;
     private readonly IRestorationExecutionOrchestrator _orchestrator;
     private readonly IRecordedMutationExecutorFactory _executorFactory;
     private readonly IRestorationMutationProviderFactory _providerFactory;
+    private readonly IConditionalOwnershipLedger _conditionalLedger;
 
     internal ControlledApprovedRecoveryExecution(
         ControlledRecoveryApprovalAuthority approvalAuthority,
-        ITransactionJournal journal,
+        IRecoveryTransactionJournal journal,
+        IConditionalOwnershipLedger ledger,
         INetworkStateManager network,
         IRestorationExecutionOrchestrator orchestrator,
         IRecordedMutationExecutorFactory executorFactory,
@@ -284,6 +286,7 @@ internal sealed class ControlledApprovedRecoveryExecution
     {
         _approvalAuthority = approvalAuthority ?? throw new ArgumentNullException(nameof(approvalAuthority));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
+        _conditionalLedger = ledger ?? throw new ArgumentNullException(nameof(ledger));
         _network = network ?? throw new ArgumentNullException(nameof(network));
         _orchestrator = orchestrator ?? throw new ArgumentNullException(nameof(orchestrator));
         _executorFactory = executorFactory ?? throw new ArgumentNullException(nameof(executorFactory));
@@ -297,13 +300,8 @@ internal sealed class ControlledApprovedRecoveryExecution
         var proof = _approvalAuthority.Consume(ticket, cancellationToken);
         var authority = new ControlledRestorationActivationAuthority(new ApprovedRecoveryActivationTrigger(proof));
         var workflow = new ControlledRecoveryRestorationWorkflow(
-            _journal,
-            _network,
-            _orchestrator,
-            _executorFactory,
-            authority,
-            _providerFactory,
-            proof.BindPreparation);
+            _journal, _conditionalLedger, _network, _orchestrator, _executorFactory,
+            authority, _providerFactory, proof.BindPreparation);
         return workflow.ExecuteAsync(
             new RecoveryRestorationRequest(proof.SessionId, proof.JournalFingerprint),
             cancellationToken);

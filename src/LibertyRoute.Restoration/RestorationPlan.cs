@@ -211,13 +211,13 @@ public static class RestorationPlanner
         }
     }
 
-    private static string RouteIdentity(RouteState route)
+    internal static string RouteIdentity(RouteState route)
     {
         var (address, prefixLength) = ParsePrefix(route.Destination);
         return $"{route.AddressFamily}|{address}|{prefixLength}";
     }
 
-    private static string RouteValue(RouteState route)
+    internal static string RouteValue(RouteState route)
         => $"destination={CanonicalPrefix(route.Destination)};nextHop={route.NextHop};interfaceIndex={route.InterfaceIndex};metric={route.Metric};addressFamily={route.AddressFamily}";
 
     private static string RouteChangeReason(RouteState original, RouteState current)
