@@ -262,7 +262,10 @@ public sealed record PersistedOwnedChange(
            StringComparer.Ordinal.Equals(AppliedValue, other.AppliedValue) &&
            RecordedAtUtc.Equals(other.RecordedAtUtc) &&
            Nullable.Equals(SequenceNumber, other.SequenceNumber) &&
-           EvidenceSource == other.EvidenceSource;
+           EvidenceSource == other.EvidenceSource &&
+           Purpose == other.Purpose &&
+           Nullable.Equals(RecoveryAttemptId, other.RecoveryAttemptId) &&
+           Nullable.Equals(AuthorizationEvidenceId, other.AuthorizationEvidenceId);
 
     /// <summary>
     /// Only forward single-step lifecycle advances are valid:
@@ -342,4 +345,27 @@ internal static class OwnershipLedgerOrdering
             .ThenBy(record => record.ChangeId)
             .ThenBy(record => record.RecordedAtUtc)
             .ToArray();
+}
+
+public sealed record OwnershipLedgerSnapshot(
+    Guid SessionId,
+    IReadOnlyList<PersistedOwnedChange> Records,
+    string LedgerRevision);
+
+public sealed record OwnershipRecordTransition(
+    Guid ChangeId,
+    OwnedChangeLifecycle? ExpectedLifecycle,
+    PersistedOwnedChange Proposed);
+
+public interface IConditionalOwnershipLedger : IOwnershipLedger
+{
+    Task<OwnershipLedgerSnapshot> ReadVersionedAsync(
+        Guid sessionId,
+        CancellationToken cancellationToken);
+
+    Task<bool> TryApplyTransitionsAsync(
+        Guid sessionId,
+        string expectedLedgerRevision,
+        IReadOnlyList<OwnershipRecordTransition> transitions,
+        CancellationToken cancellationToken);
 }

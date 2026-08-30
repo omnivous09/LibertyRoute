@@ -58,7 +58,10 @@ public sealed class OwnershipLedgerTests : IAsyncLifetime
         int? sequence = null,
         DateTimeOffset? recordedAt = null,
         OwnershipEvidenceSource source = OwnershipEvidenceSource.MutationLedger,
-        OwnedChangeLifecycle lifecycle = OwnedChangeLifecycle.Planned)
+        OwnedChangeLifecycle lifecycle = OwnedChangeLifecycle.Planned,
+        RecordPurpose purpose = RecordPurpose.SessionMutation,
+        Guid? recoveryAttemptId = null,
+        Guid? authorizationEvidenceId = null)
         => PersistedOwnedChange.Create(
             sessionId ?? SessionA,
             changeId ?? Guid.NewGuid(),
@@ -69,7 +72,10 @@ public sealed class OwnershipLedgerTests : IAsyncLifetime
             recordedAt ?? RecordedAt,
             sequence,
             source,
-            lifecycle);
+            lifecycle,
+            purpose,
+            recoveryAttemptId,
+            authorizationEvidenceId);
 
     private static async Task WriteRawLedgerAsync(string root, Guid sessionId, string payload)
     {
@@ -806,5 +812,338 @@ public sealed class OwnershipLedgerTests : IAsyncLifetime
         var stored = Assert.Single(read);
         Assert.Equal("route-after-clear", stored.TargetIdentity);
         Assert.DoesNotContain(existing, read); // No resurrection from stale pre-clear state.
+    }
+
+    [Fact]
+    public async Task VersionedReadReturnsStableExactPayloadRevision()
+    {
+        var ledger = NewLedger();
+        await ledger.AppendAsync(Record(), CancellationToken.None);
+
+        var first = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var second = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        using var document = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(_root, $"{SessionA:N}.lrw")));
+        var payload = document.RootElement.GetProperty("payload").GetString()!;
+
+        Assert.Equal(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload))), first.LedgerRevision);
+        Assert.Equal(first.LedgerRevision, second.LedgerRevision);
+        Assert.Matches("^[0-9A-F]{64}$", first.LedgerRevision);
+    }
+
+    [Fact]
+    public async Task ConditionalTransitionsSupportOnlyAdjacentLifecycleSteps()
+    {
+        var ledger = NewLedger();
+        var planned = Record(changeId: Guid.NewGuid());
+        var empty = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        Assert.True(await ledger.TryApplyTransitionsAsync(SessionA, empty.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, null, planned) }, CancellationToken.None));
+
+        var afterPlanned = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var applied = planned with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true };
+        Assert.True(await ledger.TryApplyTransitionsAsync(SessionA, afterPlanned.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, OwnedChangeLifecycle.Planned, applied) }, CancellationToken.None));
+
+        var afterApplied = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var reverted = applied with { Lifecycle = OwnedChangeLifecycle.Reverted, IsComplete = false };
+        Assert.True(await ledger.TryApplyTransitionsAsync(SessionA, afterApplied.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, OwnedChangeLifecycle.Applied, reverted) }, CancellationToken.None));
+
+        var final = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        Assert.Equal(OwnedChangeLifecycle.Reverted, Assert.Single(final.Records).Lifecycle);
+        Assert.NotEqual(empty.LedgerRevision, afterPlanned.LedgerRevision);
+        Assert.NotEqual(afterPlanned.LedgerRevision, afterApplied.LedgerRevision);
+        Assert.NotEqual(afterApplied.LedgerRevision, final.LedgerRevision);
+    }
+
+    [Fact]
+    public async Task StaleRevisionAndLifecycleMismatchReturnFalseWithoutMutation()
+    {
+        var ledger = NewLedger();
+        var planned = Record();
+        var empty = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        Assert.True(await ledger.TryApplyTransitionsAsync(SessionA, empty.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, null, planned) }, CancellationToken.None));
+        var current = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var applied = planned with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true };
+
+        Assert.False(await ledger.TryApplyTransitionsAsync(SessionA, empty.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, OwnedChangeLifecycle.Planned, applied) }, CancellationToken.None));
+        var reverted = applied with { Lifecycle = OwnedChangeLifecycle.Reverted, IsComplete = false };
+        Assert.False(await ledger.TryApplyTransitionsAsync(SessionA, current.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, OwnedChangeLifecycle.Applied, reverted) }, CancellationToken.None));
+        Assert.Equal(current.LedgerRevision, (await ledger.ReadVersionedAsync(SessionA, CancellationToken.None)).LedgerRevision);
+    }
+
+    [Fact]
+    public async Task ForbiddenTransitionThrowsEvenWhenRevisionIsStale()
+    {
+        var ledger = NewLedger();
+        var stale = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var planned = Record();
+        await ledger.AppendAsync(planned, CancellationToken.None);
+        var before = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var reverted = planned with { Lifecycle = OwnedChangeLifecycle.Reverted, IsComplete = false };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ledger.TryApplyTransitionsAsync(
+            SessionA, stale.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, OwnedChangeLifecycle.Planned, reverted) },
+            CancellationToken.None));
+
+        var after = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        Assert.Equal(before.LedgerRevision, after.LedgerRevision);
+        Assert.Equal(planned, Assert.Single(after.Records));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("ABC")]
+    [InlineData("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
+    [InlineData("GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG")]
+    public async Task MalformedRevisionIsRejected(string revision)
+    {
+        var ledger = NewLedger();
+        var proposed = Record();
+        await Assert.ThrowsAsync<ArgumentException>(() => ledger.TryApplyTransitionsAsync(
+            SessionA, revision, new[] { new OwnershipRecordTransition(proposed.ChangeId, null, proposed) }, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RevisionComparisonIsOrdinalAndDoesNotNormalizeCasing()
+    {
+        var ledger = NewLedger();
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var lower = snapshot.LedgerRevision.ToLowerInvariant();
+        Assert.NotEqual(snapshot.LedgerRevision, lower);
+        var proposed = Record();
+        Assert.False(await ledger.TryApplyTransitionsAsync(SessionA, lower,
+            new[] { new OwnershipRecordTransition(proposed.ChangeId, null, proposed) }, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task MalformedTransitionSetIsRejectedBeforePublication()
+    {
+        var ledger = NewLedger();
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var first = Record();
+        var other = Record();
+
+        await Assert.ThrowsAsync<ArgumentException>(() => ledger.TryApplyTransitionsAsync(SessionA, snapshot.LedgerRevision,
+            new[]
+            {
+                new OwnershipRecordTransition(first.ChangeId, null, first),
+                new OwnershipRecordTransition(first.ChangeId, null, first)
+            }, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentException>(() => ledger.TryApplyTransitionsAsync(SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(first.ChangeId, null, other) }, CancellationToken.None));
+        Assert.Empty((await ledger.ReadVersionedAsync(SessionA, CancellationToken.None)).Records);
+    }
+
+    [Theory]
+    [InlineData(null, OwnedChangeLifecycle.Applied)]
+    [InlineData(null, OwnedChangeLifecycle.Reverted)]
+    [InlineData(OwnedChangeLifecycle.Planned, OwnedChangeLifecycle.Planned)]
+    [InlineData(OwnedChangeLifecycle.Planned, OwnedChangeLifecycle.Reverted)]
+    [InlineData(OwnedChangeLifecycle.Applied, OwnedChangeLifecycle.Planned)]
+    [InlineData(OwnedChangeLifecycle.Reverted, OwnedChangeLifecycle.Applied)]
+    public async Task ForbiddenTransitionsAreRejected(OwnedChangeLifecycle? expected, OwnedChangeLifecycle proposedLifecycle)
+    {
+        var ledger = NewLedger();
+        var record = Record(lifecycle: expected ?? OwnedChangeLifecycle.Planned);
+        if (expected.HasValue)
+            await ledger.AppendAsync(record, CancellationToken.None);
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var proposed = record with
+        {
+            Lifecycle = proposedLifecycle,
+            IsComplete = proposedLifecycle == OwnedChangeLifecycle.Applied
+        };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ledger.TryApplyTransitionsAsync(
+            SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(record.ChangeId, expected, proposed) }, CancellationToken.None));
+        Assert.Equal(snapshot.LedgerRevision, (await ledger.ReadVersionedAsync(SessionA, CancellationToken.None)).LedgerRevision);
+    }
+
+    [Theory]
+    [InlineData("target")]
+    [InlineData("purpose")]
+    [InlineData("attempt")]
+    [InlineData("evidence")]
+    public async Task ConditionalTransitionRejectsImmutableIdentityAndProvenanceMutation(string field)
+    {
+        var ledger = NewLedger();
+        var attempt = Guid.NewGuid();
+        var evidence = Guid.NewGuid();
+        var planned = Record(purpose: RecordPurpose.RecoveryMutation, recoveryAttemptId: attempt,
+            authorizationEvidenceId: evidence);
+        await ledger.AppendAsync(planned, CancellationToken.None);
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var applied = planned with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true };
+        applied = field switch
+        {
+            "target" => applied with { TargetIdentity = "different-operation-target" },
+            "purpose" => applied with { Purpose = RecordPurpose.SessionMutation, RecoveryAttemptId = null, AuthorizationEvidenceId = null },
+            "attempt" => applied with { RecoveryAttemptId = Guid.NewGuid() },
+            _ => applied with { AuthorizationEvidenceId = Guid.NewGuid() }
+        };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ledger.TryApplyTransitionsAsync(
+            SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, OwnedChangeLifecycle.Planned, applied) }, CancellationToken.None));
+        Assert.Equal(planned, Assert.Single((await ledger.ReadVersionedAsync(SessionA, CancellationToken.None)).Records));
+    }
+
+    [Fact]
+    public async Task MultiRecordTransitionIsAtomicAndPreservesUnmentionedRecords()
+    {
+        var ledger = NewLedger();
+        var one = Record(changeId: Guid.NewGuid(), target: "one");
+        var two = Record(changeId: Guid.NewGuid(), target: "two");
+        var untouched = Record(changeId: Guid.NewGuid(), target: "untouched", lifecycle: OwnedChangeLifecycle.Applied);
+        await ledger.AppendAsync(one, CancellationToken.None);
+        await ledger.AppendAsync(two, CancellationToken.None);
+        await ledger.AppendAsync(untouched, CancellationToken.None);
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var oneApplied = one with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true };
+        var twoApplied = two with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true };
+
+        Assert.True(await ledger.TryApplyTransitionsAsync(SessionA, snapshot.LedgerRevision,
+            new[]
+            {
+                new OwnershipRecordTransition(one.ChangeId, OwnedChangeLifecycle.Planned, oneApplied),
+                new OwnershipRecordTransition(two.ChangeId, OwnedChangeLifecycle.Planned, twoApplied)
+            }, CancellationToken.None));
+        var records = (await ledger.ReadVersionedAsync(SessionA, CancellationToken.None)).Records;
+        Assert.Equal(oneApplied, records.Single(record => record.ChangeId == one.ChangeId));
+        Assert.Equal(twoApplied, records.Single(record => record.ChangeId == two.ChangeId));
+        Assert.Equal(untouched, records.Single(record => record.ChangeId == untouched.ChangeId));
+    }
+
+    [Fact]
+    public async Task InvalidMultiRecordMemberPublishesNothing()
+    {
+        var ledger = NewLedger();
+        var one = Record(changeId: Guid.NewGuid());
+        var two = Record(changeId: Guid.NewGuid());
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var forbidden = two with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ledger.TryApplyTransitionsAsync(
+            SessionA, snapshot.LedgerRevision,
+            new[]
+            {
+                new OwnershipRecordTransition(one.ChangeId, null, one),
+                new OwnershipRecordTransition(two.ChangeId, null, forbidden)
+            }, CancellationToken.None));
+        var after = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        Assert.Empty(after.Records);
+        Assert.Equal(snapshot.LedgerRevision, after.LedgerRevision);
+    }
+
+    [Fact]
+    public async Task MalformedDurableProvenanceAndNullRecordsFailClosedForVersionedRead()
+    {
+        var malformed = new PersistedOwnedChange(
+            SessionA, Guid.NewGuid(), DryRunOperationCategory.Route, "route", "before", "after",
+            RecordedAt, 1, OwnershipEvidenceSource.MutationLedger, OwnedChangeLifecycle.Planned, false,
+            RecordPurpose.RecoveryMutation, null, Guid.NewGuid());
+        await WriteRawLedgerAsync(_root, SessionA, JsonSerializer.Serialize(new PersistedOwnedChange?[] { malformed }, RawJsonOptions));
+        await Assert.ThrowsAsync<InvalidDataException>(() => NewLedger().ReadVersionedAsync(SessionA, CancellationToken.None));
+
+        await WriteRawLedgerAsync(_root, SessionA, JsonSerializer.Serialize(new PersistedOwnedChange?[] { null }, RawJsonOptions));
+        await Assert.ThrowsAsync<InvalidDataException>(() => NewLedger().ReadVersionedAsync(SessionA, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task SeparateSamePathInstancesCannotStaleOverwrite()
+    {
+        var first = NewLedger();
+        var second = NewLedger();
+        var snapshot = await first.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var winner = Record(target: "winner");
+        var loser = Record(target: "loser");
+
+        Assert.True(await first.TryApplyTransitionsAsync(SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(winner.ChangeId, null, winner) }, CancellationToken.None));
+        Assert.False(await second.TryApplyTransitionsAsync(SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(loser.ChangeId, null, loser) }, CancellationToken.None));
+        Assert.Equal(winner, Assert.Single((await first.ReadVersionedAsync(SessionA, CancellationToken.None)).Records));
+    }
+
+    [Fact]
+    public async Task SamePathGateCoversMatchedExpectationThroughPublication()
+    {
+        var seed = NewLedger();
+        var snapshot = await seed.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var matched = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var first = new FileOwnershipLedger(_root, async cancellationToken =>
+        {
+            matched.SetResult();
+            await release.Task.WaitAsync(cancellationToken);
+        });
+        var second = NewLedger();
+        var winner = Record(target: "winner");
+        var loser = Record(target: "loser");
+
+        var firstTask = first.TryApplyTransitionsAsync(SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(winner.ChangeId, null, winner) }, CancellationToken.None);
+        await matched.Task;
+        var secondTask = second.TryApplyTransitionsAsync(SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(loser.ChangeId, null, loser) }, CancellationToken.None);
+        Assert.False(secondTask.IsCompleted);
+        release.SetResult();
+
+        Assert.True(await firstTask);
+        Assert.False(await secondTask);
+        Assert.Equal(winner, Assert.Single((await seed.ReadVersionedAsync(SessionA, CancellationToken.None)).Records));
+    }
+
+    [Fact]
+    public async Task CancellationAfterExpectationMatchButBeforePublicationPreservesRevision()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var ledger = new FileOwnershipLedger(_root, _ =>
+        {
+            cancellation.Cancel();
+            return Task.CompletedTask;
+        });
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var proposed = Record();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => ledger.TryApplyTransitionsAsync(
+            SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(proposed.ChangeId, null, proposed) }, cancellation.Token));
+        var after = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        Assert.Equal(snapshot.LedgerRevision, after.LedgerRevision);
+        Assert.Empty(after.Records);
+        Assert.Empty(Directory.GetFiles(_root, "*.tmp"));
+    }
+
+    [Fact]
+    public async Task RecoveryProvenanceSurvivesEveryConditionalLifecycleTransition()
+    {
+        var ledger = NewLedger();
+        var attempt = Guid.NewGuid();
+        var evidence = Guid.NewGuid();
+        var planned = Record(purpose: RecordPurpose.RecoveryMutation, recoveryAttemptId: attempt,
+            authorizationEvidenceId: evidence);
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        Assert.True(await ledger.TryApplyTransitionsAsync(SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, null, planned) }, CancellationToken.None));
+        snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var applied = planned with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true };
+        Assert.True(await ledger.TryApplyTransitionsAsync(SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, OwnedChangeLifecycle.Planned, applied) }, CancellationToken.None));
+        snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var reverted = applied with { Lifecycle = OwnedChangeLifecycle.Reverted, IsComplete = false };
+        Assert.True(await ledger.TryApplyTransitionsAsync(SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, OwnedChangeLifecycle.Applied, reverted) }, CancellationToken.None));
+
+        var final = Assert.Single((await ledger.ReadVersionedAsync(SessionA, CancellationToken.None)).Records);
+        Assert.Equal(RecordPurpose.RecoveryMutation, final.Purpose);
+        Assert.Equal(attempt, final.RecoveryAttemptId);
+        Assert.Equal(evidence, final.AuthorizationEvidenceId);
     }
 }
