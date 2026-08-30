@@ -1,4 +1,6 @@
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using LibertyRoute.Core;
 using LibertyRoute.Recovery;
@@ -295,6 +297,7 @@ public sealed class RecoveryDurabilityTests
         Assert.True(RecoveryCompletion.IsValidTransition(RecoveryPhase.Prepared, RecoveryPhase.ExecutionStarted));
         Assert.True(RecoveryCompletion.IsValidTransition(RecoveryPhase.LedgerFinalized, RecoveryPhase.TerminalCommitted));
         Assert.True(RecoveryCompletion.IsValidTransition(RecoveryPhase.ExecutionStarted, RecoveryPhase.ManualRecoveryRequired));
+        Assert.False(RecoveryCompletion.IsValidTransition(RecoveryPhase.Prepared, RecoveryPhase.Prepared));
         Assert.False(RecoveryCompletion.IsValidTransition(RecoveryPhase.Prepared, RecoveryPhase.IntentRecorded));
         Assert.False(RecoveryCompletion.IsValidTransition(RecoveryPhase.IntentRecorded, RecoveryPhase.ExecutionStarted));
     }
@@ -303,7 +306,7 @@ public sealed class RecoveryDurabilityTests
     public void ManualRecoveryValidationUsesIntentRecordedOriginHistory()
     {
         var completion = CompletionAt(RecoveryPhase.IntentRecorded)
-            .WithPhase(RecoveryPhase.ManualRecoveryRequired) with { FailureReason = "failed" };
+            .WithPhase(RecoveryPhase.ManualRecoveryRequired, failureReason: "failed");
 
         Assert.Equal(string.Empty, RecoveryCompletion.Validate(completion));
     }
@@ -312,7 +315,7 @@ public sealed class RecoveryDurabilityTests
     public void ManualRecoveryValidationUsesPreparedOriginHistory()
     {
         var completion = CompletionAt(RecoveryPhase.Prepared)
-            .WithPhase(RecoveryPhase.ManualRecoveryRequired) with { FailureReason = "failed" };
+            .WithPhase(RecoveryPhase.ManualRecoveryRequired, failureReason: "failed");
 
         Assert.Equal(string.Empty, RecoveryCompletion.Validate(completion));
         Assert.Null(completion.ExecutionStartedAtUtc);
@@ -322,7 +325,7 @@ public sealed class RecoveryDurabilityTests
     public void ManualRecoveryValidationUsesExecutionStartedOriginHistory()
     {
         var completion = CompletionAt(RecoveryPhase.ExecutionStarted)
-            .WithPhase(RecoveryPhase.ManualRecoveryRequired) with { FailureReason = "failed" };
+            .WithPhase(RecoveryPhase.ManualRecoveryRequired, failureReason: "failed");
 
         Assert.Equal(string.Empty, RecoveryCompletion.Validate(completion));
         Assert.Null(completion.ExecutionCompletedAtUtc);
@@ -332,11 +335,8 @@ public sealed class RecoveryDurabilityTests
     public void MalformedManualRecoveryChronologyFailsClosed()
     {
         var completion = CompletionAt(RecoveryPhase.Prepared)
-            .WithPhase(RecoveryPhase.ManualRecoveryRequired) with
-            {
-                FailureReason = "failed",
-                ExecutionStartedAtUtc = DateTimeOffset.Parse("2026-08-26T00:00:03Z")
-            };
+            .WithPhase(RecoveryPhase.ManualRecoveryRequired, failureReason: "failed") with
+            { ExecutionStartedAtUtc = DateTimeOffset.Parse("2026-08-26T00:00:03Z") };
 
         Assert.NotEqual(string.Empty, RecoveryCompletion.Validate(completion));
     }
@@ -477,12 +477,12 @@ public sealed class RecoveryDurabilityTests
     }
 
     [Fact]
-    public void IntentRecordedNullPreparationFingerprintsValidate()
+    public void IntentRecordedExactPreparationFingerprintsValidate()
     {
         var transaction = DurableTransactionAt(RecoveryPhase.IntentRecorded);
 
-        Assert.Null(transaction.RecoveryCompletion!.PreparationFingerprint);
-        Assert.Null(transaction.RecoveryCompletion.Manifest!.PreparationFingerprint);
+        Assert.Equal("prep-fingerprint", transaction.RecoveryCompletion!.PreparationFingerprint);
+        Assert.Equal("prep-fingerprint", transaction.RecoveryCompletion.Manifest!.PreparationFingerprint);
         Assert.Equal(string.Empty, RecoveryCompletion.ValidateDurableManifest(transaction.RecoveryCompletion, transaction));
     }
 
@@ -490,7 +490,7 @@ public sealed class RecoveryDurabilityTests
     public void IntentRecordedManifestOnlyPreparationFingerprintFailsClosed()
     {
         var transaction = DurableTransactionAt(RecoveryPhase.IntentRecorded);
-        var manifest = transaction.RecoveryCompletion!.Manifest! with { PreparationFingerprint = "prep-fingerprint" };
+        var manifest = transaction.RecoveryCompletion!.Manifest! with { PreparationFingerprint = null };
         var completion = transaction.RecoveryCompletion with
         {
             Manifest = manifest,
@@ -504,7 +504,7 @@ public sealed class RecoveryDurabilityTests
     public void IntentRecordedCompletionOnlyPreparationFingerprintFailsClosed()
     {
         var transaction = DurableTransactionAt(RecoveryPhase.IntentRecorded);
-        var completion = transaction.RecoveryCompletion! with { PreparationFingerprint = "prep-fingerprint" };
+        var completion = transaction.RecoveryCompletion! with { PreparationFingerprint = null };
 
         Assert.Contains("preparation fingerprint", RecoveryCompletion.ValidateDurableManifest(completion, transaction), StringComparison.OrdinalIgnoreCase);
     }
@@ -597,6 +597,381 @@ public sealed class RecoveryDurabilityTests
         }
     }
 
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    public void IntentRecordedRequiresPreparationFingerprint(string? preparationFingerprint)
+    {
+        var completion = CompletionAt(RecoveryPhase.IntentRecorded) with { PreparationFingerprint = preparationFingerprint };
+        Assert.Contains("preparation fingerprint", RecoveryCompletion.Validate(completion), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    public void ManifestFactoryRequiresPreparationFingerprint(string? preparationFingerprint)
+    {
+        Assert.Throws<ArgumentException>(() => RecoveryManifest.Create(
+            Guid.NewGuid(), Guid.NewGuid(), null, "authorized",
+            new[] { RecoveryEvidenceBinding.Create(Guid.NewGuid(), "identity", "fingerprint") },
+            Guid.NewGuid(), "operation", "route", "target", "before", "after", 1,
+            preparationFingerprint));
+    }
+
+    [Fact]
+    public void IntentPreparationComparisonIsOrdinalExact()
+    {
+        var transaction = DurableTransactionAt(RecoveryPhase.IntentRecorded);
+        var changed = transaction.RecoveryCompletion! with { PreparationFingerprint = "PREP-FINGERPRINT" };
+        Assert.Contains("preparation fingerprint", RecoveryCompletion.ValidateDurableManifest(changed, transaction), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void WithPhaseRejectsInvalidSourceAndPreservesImmutableIdentity()
+    {
+        var intent = CompletionAt(RecoveryPhase.IntentRecorded);
+        Assert.Throws<InvalidOperationException>(() => (intent with { IntentRecordedAtUtc = null }).WithPhase(RecoveryPhase.Prepared));
+
+        var prepared = intent.WithPhase(RecoveryPhase.Prepared, DateTimeOffset.Parse("2026-08-26T00:00:01Z"));
+        Assert.Equal(intent.IntentRecordedAtUtc, prepared.IntentRecordedAtUtc);
+        Assert.Equal(intent.PreparationFingerprint, prepared.PreparationFingerprint);
+        Assert.Same(intent.Manifest, prepared.Manifest);
+        Assert.Equal(intent.RecoveryManifestFingerprint, prepared.RecoveryManifestFingerprint);
+    }
+
+    [Fact]
+    public async Task VersionedReadUsesExactValidatedPayloadRevision()
+    {
+        var (journal, path, root) = NewRecoveryJournal();
+        try
+        {
+            await journal.WriteAsync(Transaction(), CancellationToken.None);
+            var snapshot = await journal.ReadActiveRecoveryAsync(CancellationToken.None);
+            Assert.NotNull(snapshot);
+            using var document = JsonDocument.Parse(await File.ReadAllTextAsync(path));
+            var payload = document.RootElement.GetProperty("payload").GetString()!;
+            Assert.Equal(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload))), snapshot!.JournalRevision);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task ConditionalRecoveryAdvanceSupportsInitialAndEveryAdjacentPhase()
+    {
+        var (journal, _, root) = NewRecoveryJournal();
+        try
+        {
+            var current = Transaction();
+            await journal.WriteAsync(current, CancellationToken.None);
+            var proposed = DurableTransactionAt(RecoveryPhase.IntentRecorded);
+            var snapshot = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            Assert.True(await journal.TryAdvanceRecoveryAsync(Expectation(snapshot), proposed, CancellationToken.None));
+
+            foreach (var phase in new[] { RecoveryPhase.Prepared, RecoveryPhase.ExecutionStarted, RecoveryPhase.ExecutionCompleted, RecoveryPhase.BaselineVerified, RecoveryPhase.LedgerFinalizing, RecoveryPhase.LedgerFinalized, RecoveryPhase.TerminalCommitted })
+            {
+                snapshot = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+                proposed = snapshot.Transaction with
+                {
+                    RecoveryCompletion = snapshot.Transaction.RecoveryCompletion!.WithPhase(
+                        phase, DateTimeOffset.Parse("2026-08-26T00:00:00Z").AddSeconds((int)phase))
+                };
+                Assert.True(await journal.TryAdvanceRecoveryAsync(Expectation(snapshot), proposed, CancellationToken.None));
+            }
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Theory]
+    [InlineData(RecoveryPhase.IntentRecorded)]
+    [InlineData(RecoveryPhase.Prepared)]
+    [InlineData(RecoveryPhase.ExecutionStarted)]
+    [InlineData(RecoveryPhase.ExecutionCompleted)]
+    [InlineData(RecoveryPhase.BaselineVerified)]
+    [InlineData(RecoveryPhase.LedgerFinalizing)]
+    [InlineData(RecoveryPhase.LedgerFinalized)]
+    public async Task ConditionalRecoveryAdvanceSupportsManualRecoveryWithExactOrigin(RecoveryPhase phase)
+    {
+        var (journal, _, root) = NewRecoveryJournal();
+        try
+        {
+            await journal.WriteAsync(DurableTransactionAt(phase), CancellationToken.None);
+            var snapshot = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            var proposed = snapshot.Transaction with
+            {
+                RecoveryCompletion = snapshot.Transaction.RecoveryCompletion!.WithPhase(
+                    RecoveryPhase.ManualRecoveryRequired, failureReason: "failure")
+            };
+            Assert.True(await journal.TryAdvanceRecoveryAsync(Expectation(snapshot), proposed, CancellationToken.None));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task StaleExpectationsReturnFalseAndPreserveReplacement()
+    {
+        var (journal, _, root) = NewRecoveryJournal();
+        try
+        {
+            var intent = DurableTransactionAt(RecoveryPhase.IntentRecorded);
+            await journal.WriteAsync(intent, CancellationToken.None);
+            var snapshot = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            var prepared = intent with { RecoveryCompletion = intent.RecoveryCompletion!.WithPhase(RecoveryPhase.Prepared, DateTimeOffset.Parse("2026-08-26T00:00:01Z")) };
+            await journal.WriteAsync(intent with { LastError = "replacement" }, CancellationToken.None);
+
+            Assert.False(await journal.TryAdvanceRecoveryAsync(Expectation(snapshot), prepared, CancellationToken.None));
+            Assert.Equal("replacement", (await journal.ReadActiveAsync(CancellationToken.None))!.LastError);
+
+            var fresh = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            var expectations = new[]
+            {
+                Expectation(fresh) with { SessionId = Guid.NewGuid() },
+                Expectation(fresh) with { ExpectedPhase = RecoveryPhase.Prepared },
+                Expectation(fresh) with { RecoveryAttemptId = Guid.NewGuid() },
+                Expectation(fresh) with { AuthorizedTransactionFingerprint = fresh.Transaction.RecoveryCompletion!.AuthorizedTransactionFingerprint.ToLowerInvariant() },
+                Expectation(fresh) with { RecoveryManifestFingerprint = fresh.Transaction.RecoveryCompletion!.RecoveryManifestFingerprint.ToLowerInvariant() }
+            };
+            foreach (var expectation in expectations)
+                Assert.False(await journal.TryAdvanceRecoveryAsync(expectation, prepared, CancellationToken.None));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task ForbiddenAndImmutableMutationTransitionsNeverPublish()
+    {
+        var (journal, _, root) = NewRecoveryJournal();
+        try
+        {
+            var intent = DurableTransactionAt(RecoveryPhase.IntentRecorded);
+            await journal.WriteAsync(intent, CancellationToken.None);
+            var snapshot = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            var nonAdjacent = DurableTransactionAt(RecoveryPhase.ExecutionStarted);
+            await Assert.ThrowsAsync<InvalidOperationException>(() => journal.TryAdvanceRecoveryAsync(Expectation(snapshot), nonAdjacent, CancellationToken.None));
+
+            var preparedCompletion = intent.RecoveryCompletion!.WithPhase(RecoveryPhase.Prepared, DateTimeOffset.Parse("2026-08-26T00:00:01Z"));
+            var mutatedManifest = preparedCompletion.Manifest! with { OperationIdentity = "changed" };
+            var mutated = intent with
+            {
+                RecoveryCompletion = preparedCompletion with
+                {
+                    Manifest = mutatedManifest,
+                    RecoveryManifestFingerprint = RecoveryFingerprinting.ComputeRecoveryManifestFingerprint(mutatedManifest)
+                }
+            };
+            await Assert.ThrowsAsync<InvalidOperationException>(() => journal.TryAdvanceRecoveryAsync(Expectation(snapshot), mutated, CancellationToken.None));
+            Assert.Equal(RecoveryPhase.IntentRecorded, (await journal.ReadActiveAsync(CancellationToken.None))!.RecoveryCompletion!.Phase);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task ConcurrentSameRevisionAdvanceHasExactlyOneWinner()
+    {
+        var (first, path, root) = NewRecoveryJournal();
+        try
+        {
+            var second = new FileTransactionJournal(path);
+            var intent = DurableTransactionAt(RecoveryPhase.IntentRecorded);
+            await first.WriteAsync(intent, CancellationToken.None);
+            var snapshot = (await first.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            var proposed = intent with { RecoveryCompletion = intent.RecoveryCompletion!.WithPhase(RecoveryPhase.Prepared, DateTimeOffset.Parse("2026-08-26T00:00:01Z")) };
+            var results = await Task.WhenAll(
+                first.TryAdvanceRecoveryAsync(Expectation(snapshot), proposed, CancellationToken.None),
+                second.TryAdvanceRecoveryAsync(Expectation(snapshot), proposed, CancellationToken.None));
+            Assert.Equal(1, results.Count(value => value));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task MalformedExpectationAndProposedStateFailWithoutPublication()
+    {
+        var (journal, _, root) = NewRecoveryJournal();
+        try
+        {
+            var intent = DurableTransactionAt(RecoveryPhase.IntentRecorded);
+            await journal.WriteAsync(intent, CancellationToken.None);
+            var snapshot = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            var prepared = intent with { RecoveryCompletion = intent.RecoveryCompletion!.WithPhase(RecoveryPhase.Prepared, DateTimeOffset.Parse("2026-08-26T00:00:01Z")) };
+
+            await Assert.ThrowsAsync<ArgumentException>(() => journal.TryAdvanceRecoveryAsync(
+                Expectation(snapshot) with { JournalRevision = " " }, prepared, CancellationToken.None));
+            await Assert.ThrowsAsync<ArgumentException>(() => journal.TryAdvanceRecoveryAsync(
+                Expectation(snapshot) with { ExpectedPhase = null }, prepared, CancellationToken.None));
+
+            var malformed = prepared with { RecoveryCompletion = prepared.RecoveryCompletion! with { PreparationFingerprint = null } };
+            await Assert.ThrowsAsync<InvalidDataException>(() => journal.TryAdvanceRecoveryAsync(
+                Expectation(snapshot), malformed, CancellationToken.None));
+            Assert.Equal(snapshot.JournalRevision, (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!.JournalRevision);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Theory]
+    [InlineData("revision", "ABC")]
+    [InlineData("revision", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
+    [InlineData("revision", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
+    [InlineData("revision", "GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG")]
+    [InlineData("authorized", "short")]
+    [InlineData("manifest", "not-hex")]
+    public async Task MalformedExpectationHashesThrow(string field, string value)
+    {
+        var (journal, _, root) = NewRecoveryJournal();
+        try
+        {
+            var intent = DurableTransactionAt(RecoveryPhase.IntentRecorded);
+            await journal.WriteAsync(intent, CancellationToken.None);
+            var snapshot = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            var expectation = field switch
+            {
+                "revision" => Expectation(snapshot) with { JournalRevision = value },
+                "authorized" => Expectation(snapshot) with { AuthorizedTransactionFingerprint = value },
+                _ => Expectation(snapshot) with { RecoveryManifestFingerprint = value }
+            };
+            var proposed = intent with { RecoveryCompletion = intent.RecoveryCompletion!.WithPhase(RecoveryPhase.Prepared, DateTimeOffset.Parse("2026-08-26T00:00:01Z")) };
+            await Assert.ThrowsAsync<ArgumentException>(() => journal.TryAdvanceRecoveryAsync(expectation, proposed, CancellationToken.None));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Theory]
+    [InlineData("adaptersNull")]
+    [InlineData("adapterElementNull")]
+    [InlineData("adapterNestedNull")]
+    [InlineData("routesElementNull")]
+    [InlineData("dnsElementNull")]
+    [InlineData("changesNull")]
+    [InlineData("changeElementNull")]
+    public async Task RechecksummedMalformedPreRecoveryTransactionFailsBeforeComparison(string shape)
+    {
+        var (journal, path, root) = NewRecoveryJournal();
+        try
+        {
+            var baseline = Transaction();
+            await journal.WriteAsync(baseline, CancellationToken.None);
+            var validSnapshot = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            var adapter = baseline.Snapshot.Adapters[0];
+            var malformed = shape switch
+            {
+                "adaptersNull" => baseline with { Snapshot = baseline.Snapshot with { Adapters = null! } },
+                "adapterElementNull" => baseline with { Snapshot = baseline.Snapshot with { Adapters = new AdapterState[] { null! } } },
+                "adapterNestedNull" => baseline with { Snapshot = baseline.Snapshot with { Adapters = new[] { adapter with { DnsServers = null! } } } },
+                "routesElementNull" => baseline with { Snapshot = baseline.Snapshot with { Routes = new RouteState[] { null! } } },
+                "dnsElementNull" => baseline with { Snapshot = baseline.Snapshot with { DnsInterfaces = new DnsInterfaceState[] { null! } } },
+                "changesNull" => baseline with { Changes = null! },
+                _ => baseline with { Changes = new OwnedNetworkChange[] { null! } }
+            };
+            await journal.WriteAsync(malformed, CancellationToken.None);
+            var before = await File.ReadAllBytesAsync(path);
+            var proposed = DurableTransactionAt(RecoveryPhase.IntentRecorded);
+            await Assert.ThrowsAsync<InvalidDataException>(() => journal.TryAdvanceRecoveryAsync(
+                Expectation(validSnapshot), proposed, CancellationToken.None));
+            Assert.Equal(before, await File.ReadAllBytesAsync(path));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task StaleCallerCannotOverwriteRealDifferentSessionReplacement()
+    {
+        var (journal, _, root) = NewRecoveryJournal();
+        try
+        {
+            var original = Transaction();
+            await journal.WriteAsync(original, CancellationToken.None);
+            var stale = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            var replacement = original with { SessionId = Guid.Parse("22222222-2222-2222-2222-222222222222") };
+            await journal.WriteAsync(replacement, CancellationToken.None);
+            var replacementSnapshot = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+
+            Assert.False(await journal.TryAdvanceRecoveryAsync(
+                Expectation(stale), DurableTransactionAt(RecoveryPhase.IntentRecorded), CancellationToken.None));
+            var after = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            Assert.Equal(replacement.SessionId, after.Transaction.SessionId);
+            Assert.Equal(replacementSnapshot.JournalRevision, after.JournalRevision);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task SamePathGateCoversExpectationMatchThroughPublication()
+    {
+        var (writer, path, root) = NewRecoveryJournal();
+        try
+        {
+            var intent = DurableTransactionAt(RecoveryPhase.IntentRecorded);
+            await writer.WriteAsync(intent, CancellationToken.None);
+            var snapshot = (await writer.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            var proposed = intent with { RecoveryCompletion = intent.RecoveryCompletion!.WithPhase(RecoveryPhase.Prepared, DateTimeOffset.Parse("2026-08-26T00:00:01Z")) };
+            var expectationMatched = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var releaseAfterMatch = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var first = new FileTransactionJournal(path, async cancellationToken =>
+            {
+                expectationMatched.SetResult();
+                await releaseAfterMatch.Task.WaitAsync(cancellationToken);
+            });
+            var second = new FileTransactionJournal(path);
+
+            var firstAdvance = first.TryAdvanceRecoveryAsync(Expectation(snapshot), proposed, CancellationToken.None);
+            await expectationMatched.Task;
+            var secondAdvance = second.TryAdvanceRecoveryAsync(Expectation(snapshot), proposed, CancellationToken.None);
+            Assert.False(secondAdvance.IsCompleted);
+            releaseAfterMatch.SetResult();
+            Assert.True(await firstAdvance);
+            Assert.False(await secondAdvance);
+            var final = (await writer.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            Assert.Equal(RecoveryPhase.Prepared, final.Transaction.RecoveryCompletion!.Phase);
+            Assert.NotEqual(snapshot.JournalRevision, final.JournalRevision);
+            Assert.Equal(string.Empty, RecoveryCompletion.Validate(final.Transaction.RecoveryCompletion));
+            Assert.Equal(string.Empty, RecoveryCompletion.ValidateDurableManifest(final.Transaction.RecoveryCompletion, final.Transaction));
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public async Task SamePhaseAndCancellationBeforePublicationDoNotReplaceJournal()
+    {
+        var (journal, _, root) = NewRecoveryJournal();
+        try
+        {
+            var intent = DurableTransactionAt(RecoveryPhase.IntentRecorded);
+            await journal.WriteAsync(intent, CancellationToken.None);
+            var snapshot = (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!;
+            await Assert.ThrowsAsync<InvalidOperationException>(() => journal.TryAdvanceRecoveryAsync(
+                Expectation(snapshot), intent, CancellationToken.None));
+
+            using var cancellation = new CancellationTokenSource();
+            cancellation.Cancel();
+            var prepared = intent with { RecoveryCompletion = intent.RecoveryCompletion!.WithPhase(RecoveryPhase.Prepared, DateTimeOffset.Parse("2026-08-26T00:00:01Z")) };
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => journal.TryAdvanceRecoveryAsync(
+                Expectation(snapshot), prepared, cancellation.Token));
+            Assert.Equal(snapshot.JournalRevision, (await journal.ReadActiveRecoveryAsync(CancellationToken.None))!.JournalRevision);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    private static (FileTransactionJournal Journal, string Path, string Root) NewRecoveryJournal()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "LibertyRoute.Recovery.Cas.Tests." + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "active.lrj");
+        return (new FileTransactionJournal(path), path, root);
+    }
+
+    private static RecoveryTransitionExpectation Expectation(RecoveryJournalSnapshot snapshot)
+    {
+        var completion = snapshot.Transaction.RecoveryCompletion;
+        return new RecoveryTransitionExpectation(
+            snapshot.Transaction.SessionId,
+            snapshot.JournalRevision,
+            completion?.Phase,
+            completion?.RecoveryAttemptId,
+            RecoveryFingerprinting.ComputeAuthorizedTransactionFingerprint(snapshot.Transaction),
+            completion?.RecoveryManifestFingerprint);
+    }
+
     private static NetworkTransaction DurableTransactionAt(RecoveryPhase phase)
     {
         var transaction = Transaction();
@@ -641,14 +1016,13 @@ public sealed class RecoveryDurabilityTests
             authorizedFingerprint,
             RecoveryFingerprinting.ComputeRecoveryManifestFingerprint(manifest),
             "44444444-4444-4444-4444-444444444444:evidence:route:binding-fingerprint",
-            null,
+            "prep-fingerprint",
             start)
         { Manifest = manifest };
 
         if (phase == RecoveryPhase.IntentRecorded)
             return completion;
 
-        completion = completion with { PreparationFingerprint = manifest.PreparationFingerprint };
         foreach (var next in new[] { RecoveryPhase.Prepared, RecoveryPhase.ExecutionStarted, RecoveryPhase.ExecutionCompleted, RecoveryPhase.BaselineVerified, RecoveryPhase.LedgerFinalizing, RecoveryPhase.LedgerFinalized, RecoveryPhase.TerminalCommitted })
         {
             completion = completion.WithPhase(next, start.AddSeconds((int)next));

@@ -150,6 +150,8 @@ public sealed record RecoveryManifest(
             .ToArray();
         if (bindings.Length == 0)
             throw new ArgumentException("At least one original evidence binding is required.", nameof(originalEvidenceBindings));
+        if (string.IsNullOrWhiteSpace(preparationFingerprint))
+            throw new ArgumentException("Preparation fingerprint is required.", nameof(preparationFingerprint));
 
         return new RecoveryManifest(
             recoveryAttemptId,
@@ -205,7 +207,7 @@ public sealed record RecoveryCompletion(
     public static bool IsValidTransition(RecoveryPhase current, RecoveryPhase next)
     {
         if (current == next)
-            return true;
+            return false;
 
         return (current, next) switch
         {
@@ -223,8 +225,6 @@ public sealed record RecoveryCompletion(
             (RecoveryPhase.LedgerFinalizing, RecoveryPhase.ManualRecoveryRequired) => true,
             (RecoveryPhase.LedgerFinalized, RecoveryPhase.TerminalCommitted) => true,
             (RecoveryPhase.LedgerFinalized, RecoveryPhase.ManualRecoveryRequired) => true,
-            (RecoveryPhase.ManualRecoveryRequired, RecoveryPhase.ManualRecoveryRequired) => true,
-            (RecoveryPhase.TerminalCommitted, RecoveryPhase.TerminalCommitted) => true,
             _ => false
         };
     }
@@ -258,12 +258,12 @@ public sealed record RecoveryCompletion(
             ? completion.ManualRecoveryOriginPhase!.Value
             : completion.Phase;
 
-        if (RequiresPrepared(reachedPhase) && string.IsNullOrWhiteSpace(completion.PreparationFingerprint))
-            return "Prepared recovery requires a preparation fingerprint.";
+        if (string.IsNullOrWhiteSpace(completion.PreparationFingerprint))
+            return "Recovery requires a preparation fingerprint.";
 
         if (!completion.IntentRecordedAtUtc.HasValue)
             return "Recovery requires an intent-recorded timestamp.";
-        if (RequiresPrepared(reachedPhase) && !completion.PreparedAtUtc.HasValue)
+        if (RequiresPreparedTimestamp(reachedPhase) && !completion.PreparedAtUtc.HasValue)
             return "Prepared or later recovery requires a prepared timestamp.";
         if (RequiresExecutionStarted(reachedPhase) && !completion.ExecutionStartedAtUtc.HasValue)
             return "Execution started requires an execution-started timestamp.";
@@ -316,7 +316,7 @@ public sealed record RecoveryCompletion(
         _ => false
     };
 
-    private static bool RequiresPrepared(RecoveryPhase phase) => phase is not RecoveryPhase.IntentRecorded;
+    private static bool RequiresPreparedTimestamp(RecoveryPhase phase) => phase is not RecoveryPhase.IntentRecorded;
     private static bool RequiresExecutionStarted(RecoveryPhase phase) => phase is RecoveryPhase.ExecutionStarted or RecoveryPhase.ExecutionCompleted or RecoveryPhase.BaselineVerified or RecoveryPhase.LedgerFinalizing or RecoveryPhase.LedgerFinalized or RecoveryPhase.TerminalCommitted;
     private static bool RequiresExecutionCompleted(RecoveryPhase phase) => phase is RecoveryPhase.ExecutionCompleted or RecoveryPhase.BaselineVerified or RecoveryPhase.LedgerFinalizing or RecoveryPhase.LedgerFinalized or RecoveryPhase.TerminalCommitted;
     private static bool RequiresBaselineVerified(RecoveryPhase phase) => phase is RecoveryPhase.BaselineVerified or RecoveryPhase.LedgerFinalizing or RecoveryPhase.LedgerFinalized or RecoveryPhase.TerminalCommitted;
@@ -422,8 +422,8 @@ public sealed record RecoveryCompletion(
             return "Manifest applied value is required.";
         if (manifest.SequenceOrder < 0)
             return "Manifest sequence order must not be negative.";
-        if (manifest.PreparationFingerprint is not null && string.IsNullOrWhiteSpace(manifest.PreparationFingerprint))
-            return "Manifest preparation fingerprint must not be empty when present.";
+        if (string.IsNullOrWhiteSpace(manifest.PreparationFingerprint))
+            return "Manifest preparation fingerprint is required.";
 
         for (var index = 0; index < manifest.OriginalEvidenceBindings.Count; index++)
         {
@@ -448,19 +448,28 @@ public sealed record RecoveryCompletion(
         return string.Empty;
     }
 
-    public RecoveryCompletion WithPhase(RecoveryPhase newPhase, DateTimeOffset? atUtc = null)
+    public RecoveryCompletion WithPhase(
+        RecoveryPhase newPhase,
+        DateTimeOffset? atUtc = null,
+        string? failureReason = null,
+        string? manualRecoveryNote = null)
     {
+        var currentFailure = Validate(this);
+        if (!string.IsNullOrEmpty(currentFailure))
+            throw new InvalidOperationException($"Current recovery completion is invalid: {currentFailure}");
         if (!IsValidTransition(Phase, newPhase))
             throw new InvalidOperationException($"Recovery phase transition {Phase} -> {newPhase} is invalid.");
+        if (Phase == newPhase)
+            throw new InvalidOperationException("Recovery phase transitions must advance to a different phase.");
 
-        return new RecoveryCompletion(
+        var result = new RecoveryCompletion(
             RecoveryAttemptId,
             newPhase,
             AuthorizedTransactionFingerprint,
             RecoveryManifestFingerprint,
             OriginalEvidenceBindings,
             PreparationFingerprint,
-            IntentRecordedAtUtc ?? (Phase == RecoveryPhase.IntentRecorded ? atUtc ?? DateTimeOffset.UtcNow : null),
+            IntentRecordedAtUtc,
             newPhase == RecoveryPhase.Prepared ? atUtc ?? DateTimeOffset.UtcNow : PreparedAtUtc,
             newPhase == RecoveryPhase.ExecutionStarted ? atUtc ?? DateTimeOffset.UtcNow : ExecutionStartedAtUtc,
             newPhase == RecoveryPhase.ExecutionCompleted ? atUtc ?? DateTimeOffset.UtcNow : ExecutionCompletedAtUtc,
@@ -468,12 +477,63 @@ public sealed record RecoveryCompletion(
             newPhase == RecoveryPhase.LedgerFinalizing ? atUtc ?? DateTimeOffset.UtcNow : LedgerFinalizingAtUtc,
             newPhase == RecoveryPhase.LedgerFinalized ? atUtc ?? DateTimeOffset.UtcNow : LedgerFinalizedAtUtc,
             newPhase == RecoveryPhase.TerminalCommitted ? atUtc ?? DateTimeOffset.UtcNow : TerminalCommittedAtUtc,
-            FailureReason,
-            ManualRecoveryNote)
+            newPhase == RecoveryPhase.ManualRecoveryRequired ? failureReason : FailureReason,
+            newPhase == RecoveryPhase.ManualRecoveryRequired ? manualRecoveryNote : ManualRecoveryNote)
         {
             Manifest = Manifest,
             ManualRecoveryOriginPhase = newPhase == RecoveryPhase.ManualRecoveryRequired ? ManualRecoveryOriginPhase ?? Phase : null
         };
+
+        var resultFailure = Validate(result);
+        if (!string.IsNullOrEmpty(resultFailure))
+            throw new InvalidOperationException($"Resulting recovery completion is invalid: {resultFailure}");
+        return result;
+    }
+
+    public static string ValidateImmutableIdentity(NetworkTransaction current, NetworkTransaction proposed)
+    {
+        ArgumentNullException.ThrowIfNull(current);
+        ArgumentNullException.ThrowIfNull(proposed);
+        var left = current.RecoveryCompletion;
+        var right = proposed.RecoveryCompletion;
+        if (left is null || right is null || left.Manifest is null || right.Manifest is null)
+            return "Both recovery transactions require durable recovery manifests.";
+        if (current.SessionId != proposed.SessionId || !StringComparer.Ordinal.Equals(current.OwnerSid, proposed.OwnerSid))
+            return "Recovery transaction session or owner identity changed.";
+        if (left.RecoveryAttemptId != right.RecoveryAttemptId ||
+            !StringComparer.Ordinal.Equals(left.AuthorizedTransactionFingerprint, right.AuthorizedTransactionFingerprint) ||
+            !StringComparer.Ordinal.Equals(left.RecoveryManifestFingerprint, right.RecoveryManifestFingerprint) ||
+            !StringComparer.Ordinal.Equals(left.PreparationFingerprint, right.PreparationFingerprint) ||
+            !StringComparer.Ordinal.Equals(left.OriginalEvidenceBindings, right.OriginalEvidenceBindings))
+            return "Recovery completion immutable identity changed.";
+
+        var a = left.Manifest;
+        var b = right.Manifest;
+        if (a.RecoveryAttemptId != b.RecoveryAttemptId || a.SessionId != b.SessionId ||
+            !StringComparer.Ordinal.Equals(a.OwnerSid, b.OwnerSid) ||
+            !StringComparer.Ordinal.Equals(a.AuthorizedTransactionFingerprint, b.AuthorizedTransactionFingerprint) ||
+            a.RecoveryOwnershipChangeId != b.RecoveryOwnershipChangeId ||
+            !StringComparer.Ordinal.Equals(a.OperationIdentity, b.OperationIdentity) ||
+            !StringComparer.Ordinal.Equals(a.OperationCategory, b.OperationCategory) ||
+            !StringComparer.Ordinal.Equals(a.TargetIdentity, b.TargetIdentity) ||
+            !StringComparer.Ordinal.Equals(a.OriginalValue, b.OriginalValue) ||
+            !StringComparer.Ordinal.Equals(a.AppliedValue, b.AppliedValue) ||
+            a.SequenceOrder != b.SequenceOrder ||
+            !StringComparer.Ordinal.Equals(a.PreparationFingerprint, b.PreparationFingerprint) ||
+            a.OriginalEvidenceBindings.Count != b.OriginalEvidenceBindings.Count)
+            return "Typed recovery manifest immutable identity changed.";
+
+        for (var index = 0; index < a.OriginalEvidenceBindings.Count; index++)
+        {
+            var x = a.OriginalEvidenceBindings[index];
+            var y = b.OriginalEvidenceBindings[index];
+            if (x.EvidenceId != y.EvidenceId ||
+                !StringComparer.Ordinal.Equals(x.EvidenceIdentity, y.EvidenceIdentity) ||
+                !StringComparer.Ordinal.Equals(x.EvidenceFingerprint, y.EvidenceFingerprint))
+                return "Typed recovery evidence binding immutable identity changed.";
+        }
+
+        return string.Empty;
     }
 }
 
