@@ -726,7 +726,7 @@ public sealed class RecoveryDurabilityTests
                 authFingerprint,
                 manifestFingerprint,
                 "44444444-4444-4444-4444-444444444444:evidence:route:binding-fingerprint",
-                "prepared-fingerprint",
+                "prep-fingerprint",
                 DateTimeOffset.Parse("2026-08-26T00:00:00Z"),
                 DateTimeOffset.Parse("2026-08-26T00:00:00Z"),
                 DateTimeOffset.Parse("2026-08-26T00:00:00Z"),
@@ -755,7 +755,7 @@ public sealed class RecoveryDurabilityTests
                 authFingerprint,
                 wrongManifestFingerprint,
                 "44444444-4444-4444-4444-444444444444:evidence:route:binding-fingerprint",
-                "prepared-fingerprint",
+                "prep-fingerprint",
                 DateTimeOffset.Parse("2026-08-26T00:00:00Z"),
                 DateTimeOffset.Parse("2026-08-26T00:00:00Z"),
                 DateTimeOffset.Parse("2026-08-26T00:00:00Z"),
@@ -1181,7 +1181,7 @@ public sealed class RecoveryDurabilityTests
     {
         var sessionId = Guid.Parse("11111111-1111-1111-1111-111111111111");
         var operationIdentity = "test-operation";
-        var expectedChangeId = Guid.Parse("4d8eb7ac-2a4d-588f-e049-ff00b4e8ccaa");
+        var expectedChangeId = Guid.Parse("482aff7c-7505-71b1-15a4-3521282c0b8f");
 
         var derived1 = OwnershipIdentity.DeriveChangeId(sessionId, operationIdentity);
         var derived2 = OwnershipIdentity.DeriveChangeId(sessionId, operationIdentity);
