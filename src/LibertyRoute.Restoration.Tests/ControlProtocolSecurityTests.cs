@@ -418,7 +418,7 @@ public sealed class ControlProtocolSecurityTests
         Assert.Contains("LibertyRoute.ControlProtocol", desktopProject, StringComparison.Ordinal);
         Assert.DoesNotContain("LibertyRoute.Service", desktopProject, StringComparison.Ordinal);
         Assert.DoesNotContain("LibertyRoute.Restoration.Windows", desktopProject, StringComparison.Ordinal);
-        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
         Assert.Contains("LibertyRoute.Network.v2", worker, StringComparison.Ordinal);
         Assert.DoesNotContain("LibertyRoute.Network.v1", worker, StringComparison.Ordinal);
         Assert.DoesNotContain("ReadLineAsync", worker, StringComparison.Ordinal);

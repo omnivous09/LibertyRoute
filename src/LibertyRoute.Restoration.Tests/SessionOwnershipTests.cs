@@ -569,7 +569,7 @@ public sealed class SessionOwnershipTests
         Assert.DoesNotContain("OwnerSid", protocol, StringComparison.Ordinal);
         Assert.DoesNotContain("OwnerSid", desktop, StringComparison.Ordinal);
         Assert.DoesNotContain("OwnerSid", ledger, StringComparison.Ordinal);
-        Assert.DoesNotContain("Restoration.Windows", serviceProject, StringComparison.Ordinal);
+        Assert.Contains("Restoration.Windows", serviceProject, StringComparison.Ordinal);
         Assert.DoesNotContain("Recovery", commands, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Restoration", commands, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(4, Enum.GetValues<ControlCommand>().Length);

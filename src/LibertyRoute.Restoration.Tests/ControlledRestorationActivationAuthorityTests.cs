@@ -619,7 +619,7 @@ public sealed class ControlledRestorationActivationAuthorityTests
         Assert.Null(provider.GetService(typeof(RestorationExecutionCapability)));
 
         var serviceProject = ReadSource("src", "LibertyRoute.Service", "LibertyRoute.Service.csproj");
-        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
 
         var normalSources = ProductionSourcesExcludingRestorationWindows();
         Assert.DoesNotContain(normalSources, path => File.ReadAllText(path).Contains(
@@ -652,7 +652,7 @@ public sealed class ControlledRestorationActivationAuthorityTests
             "RestorationExecutionCapability", "ControlledRestorationActivationHandoff"
         })
             Assert.DoesNotContain(activationType, worker, StringComparison.Ordinal);
-        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
     }
 
     private static string RepoRoot()

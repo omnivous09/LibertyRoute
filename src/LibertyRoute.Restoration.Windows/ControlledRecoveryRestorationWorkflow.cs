@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -55,14 +54,6 @@ internal sealed record RecoveryRestorationWorkflowResult(
 /// </summary>
 internal sealed class ControlledRecoveryRestorationWorkflow
 {
-    private sealed class SessionLease
-    {
-        internal SemaphoreSlim Semaphore { get; } = new(1, 1);
-        internal int Users { get; set; }
-        internal bool Removed { get; set; }
-    }
-
-    private static readonly ConcurrentDictionary<Guid, SessionLease> SessionLeases = new();
     private readonly ITransactionJournal _journal;
     private readonly INetworkStateManager _network;
     private readonly IRestorationExecutionOrchestrator _orchestrator;
@@ -130,9 +121,7 @@ internal sealed class ControlledRecoveryRestorationWorkflow
             return Result(RecoveryRestorationWorkflowStatus.InvalidRequest, null, null, "A recovery session id is required.");
 
         cancellationToken.ThrowIfCancellationRequested();
-        var sessionLease = await AcquireSessionLeaseAsync(request.SessionId, cancellationToken).ConfigureAwait(false);
-        try
-        {
+        using var sessionLease = await RecoverySessionLease.AcquireAsync(_journal, cancellationToken).ConfigureAwait(false);
             var journal = await _journal.ReadActiveAsync(cancellationToken).ConfigureAwait(false);
             var initialValidation = ValidateJournal(request, journal);
             if (initialValidation is not null)
@@ -232,58 +221,6 @@ internal sealed class ControlledRecoveryRestorationWorkflow
                 RecoveryRestorationWorkflowStatus.ExecutionReturned, journal.SessionId, journal.State,
                 operationCount, blockers, activation.Status, null, recoveryExecution.Reason)
             { RecoveryExecution = recoveryExecution };
-        }
-        finally
-        {
-            ReleaseSessionLease(request.SessionId, sessionLease);
-        }
-    }
-
-    private static async Task<SessionLease> AcquireSessionLeaseAsync(
-        Guid sessionId,
-        CancellationToken cancellationToken)
-    {
-        while (true)
-        {
-            var lease = SessionLeases.GetOrAdd(sessionId, static _ => new SessionLease());
-            lock (lease)
-            {
-                if (lease.Removed)
-                    continue;
-                lease.Users++;
-            }
-
-            try
-            {
-                await lease.Semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
-                return lease;
-            }
-            catch
-            {
-                ReleaseSessionLeaseReference(sessionId, lease);
-                throw;
-            }
-        }
-    }
-
-    private static void ReleaseSessionLease(Guid sessionId, SessionLease lease)
-    {
-        lease.Semaphore.Release();
-        ReleaseSessionLeaseReference(sessionId, lease);
-    }
-
-    private static void ReleaseSessionLeaseReference(Guid sessionId, SessionLease lease)
-    {
-        lock (lease)
-        {
-            lease.Users--;
-            if (lease.Users != 0)
-                return;
-
-            lease.Removed = true;
-            var pair = new KeyValuePair<Guid, SessionLease>(sessionId, lease);
-            ((ICollection<KeyValuePair<Guid, SessionLease>>)SessionLeases).Remove(pair);
-        }
     }
 
     private static RecoveryRestorationWorkflowResult? ValidateJournal(

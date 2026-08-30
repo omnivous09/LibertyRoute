@@ -2,6 +2,7 @@ using LibertyRoute.Engine;
 using LibertyRoute.Networking;
 using LibertyRoute.Recovery;
 using LibertyRoute.Restoration;
+using LibertyRoute.Restoration.Windows;
 
 namespace LibertyRoute.Service;
 
@@ -31,7 +32,9 @@ public static class LibertyRouteRegistration
         ArgumentNullException.ThrowIfNull(services);
 
         AddCoreRegistrations(services);
-        services.AddSingleton<IOwnershipLedger, FileOwnershipLedger>();
+        services.AddSingleton<FileOwnershipLedger>();
+        services.AddSingleton<IOwnershipLedger>(provider => provider.GetRequiredService<FileOwnershipLedger>());
+        services.AddSingleton<IConditionalOwnershipLedger>(provider => provider.GetRequiredService<FileOwnershipLedger>());
         return services;
     }
 
@@ -48,7 +51,9 @@ public static class LibertyRouteRegistration
         ArgumentException.ThrowIfNullOrWhiteSpace(ownershipLedgerRoot);
 
         AddCoreRegistrations(services);
-        services.AddSingleton<IOwnershipLedger>(_ => new FileOwnershipLedger(ownershipLedgerRoot));
+        services.AddSingleton(_ => new FileOwnershipLedger(ownershipLedgerRoot));
+        services.AddSingleton<IOwnershipLedger>(provider => provider.GetRequiredService<FileOwnershipLedger>());
+        services.AddSingleton<IConditionalOwnershipLedger>(provider => provider.GetRequiredService<FileOwnershipLedger>());
         return services;
     }
 
@@ -60,7 +65,11 @@ public static class LibertyRouteRegistration
     private static void AddCoreRegistrations(IServiceCollection services)
     {
         services.AddSingleton<INetworkStateManager, WindowsNetworkStateManager>();
-        services.AddSingleton<ITransactionJournal, FileTransactionJournal>();
+        services.AddSingleton<FileTransactionJournal>();
+        services.AddSingleton<ITransactionJournal>(provider => provider.GetRequiredService<FileTransactionJournal>());
+        services.AddSingleton<IRecoveryTransactionJournal>(provider => provider.GetRequiredService<FileTransactionJournal>());
+        services.AddSingleton<IRecoveryBaselineVerifier, RecoveryBaselineVerifier>();
+        services.AddSingleton<IRecoveryStartupReconciler, RecoveryStartupReconciler>();
         services.AddSingleton<RecoveryManager>();
         services.AddSingleton<IConnectionEngine, WireGuardEngine>();
         services.AddSingleton<ConnectionController>();

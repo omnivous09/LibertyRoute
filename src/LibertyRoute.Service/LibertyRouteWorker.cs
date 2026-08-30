@@ -1,5 +1,7 @@
 namespace LibertyRoute.Service;
 
+using LibertyRoute.Restoration.Windows;
+
 internal sealed class LibertyRouteWorker : BackgroundService
 {
     private const string PipeName = "LibertyRoute.Network.v2";
@@ -7,22 +9,41 @@ internal sealed class LibertyRouteWorker : BackgroundService
     private readonly SecureControlPipeFactory _pipeFactory;
     private readonly SecureControlConnectionHandler _handler;
     private readonly ILogger<LibertyRouteWorker> _logger;
+    private readonly IRecoveryStartupReconciler _startupReconciler;
 
     public LibertyRouteWorker(
         ConnectionController controller,
         SecureControlPipeFactory pipeFactory,
         SecureControlConnectionHandler handler,
+        IRecoveryStartupReconciler startupReconciler,
         ILogger<LibertyRouteWorker> logger)
     {
         _controller = controller ?? throw new ArgumentNullException(nameof(controller));
         _pipeFactory = pipeFactory ?? throw new ArgumentNullException(nameof(pipeFactory));
         _handler = handler ?? throw new ArgumentNullException(nameof(handler));
+        _startupReconciler = startupReconciler ?? throw new ArgumentNullException(nameof(startupReconciler));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
     public override async Task StartAsync(CancellationToken cancellationToken)
     {
-        await _controller.RecoverOnStartupAsync(cancellationToken);
+        var reconciliation = await _startupReconciler.ReconcileAsync(cancellationToken);
+        switch (reconciliation.Status)
+        {
+            case RecoveryStartupReconciliationStatus.NoJournal:
+            case RecoveryStartupReconciliationStatus.ReconciledAndCleared:
+                break;
+            case RecoveryStartupReconciliationStatus.LegacyRecoveryRequired:
+                await _controller.RecoverOnStartupAsync(cancellationToken);
+                break;
+            default:
+                _logger.LogCritical(
+                    "Startup recovery failed closed with {Status}: {Reason}",
+                    reconciliation.Status,
+                    reconciliation.Reason);
+                throw new InvalidOperationException(
+                    $"Startup recovery failed closed with {reconciliation.Status}: {reconciliation.Reason}");
+        }
         await base.StartAsync(cancellationToken);
     }
 

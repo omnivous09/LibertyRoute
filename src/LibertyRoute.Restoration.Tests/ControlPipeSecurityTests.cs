@@ -847,7 +847,7 @@ public sealed class ControlPipeSecurityTests
         Assert.DoesNotContain("SecureControl", program, StringComparison.Ordinal);
         Assert.Contains("SecureControlConnectionHandler", registration, StringComparison.Ordinal);
         Assert.Contains("LibertyRoute.ControlProtocol", serviceProject, StringComparison.Ordinal);
-        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
         Assert.DoesNotContain("Recovery", string.Join(',', Enum.GetNames<ControlCommand>()), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Restoration", string.Join(',', Enum.GetNames<ControlCommand>()), StringComparison.OrdinalIgnoreCase);
 

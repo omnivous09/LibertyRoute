@@ -474,7 +474,7 @@ public sealed class ControlledWindowsRestorationExecutionBoundaryTests
                 StringComparison.Ordinal));
 
         var serviceProject = ReadSource("src", "LibertyRoute.Service", "LibertyRoute.Service.csproj");
-        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Restoration.Windows", serviceProject, StringComparison.Ordinal);
     }
 
     [Fact]

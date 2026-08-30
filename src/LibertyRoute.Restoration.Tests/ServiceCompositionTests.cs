@@ -1,4 +1,7 @@
 using System.Reflection;
+using System.Security.Principal;
+using LibertyRoute.ControlProtocol;
+using LibertyRoute.Core;
 using LibertyRoute.Engine;
 using LibertyRoute.Networking;
 using LibertyRoute.Recovery;
@@ -7,6 +10,7 @@ using LibertyRoute.Restoration.Windows;
 using LibertyRoute.Service;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
 namespace LibertyRoute.Restoration.Tests;
@@ -45,11 +49,11 @@ public sealed class ServiceCompositionTests
     // --- Project-reference graph ---
 
     [Fact]
-    public void ServiceProjectReferencesRestorationButNeverRestorationWindows()
+    public void ServiceProjectReferencesRestorationWindowsOnlyForStartupReconciliation()
     {
         var csproj = ReadSource("src", "LibertyRoute.Service", "LibertyRoute.Service.csproj");
         Assert.Contains("LibertyRoute.Restoration.csproj", csproj, StringComparison.Ordinal);
-        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", csproj, StringComparison.Ordinal);
+        Assert.Contains("LibertyRoute.Restoration.Windows", csproj, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -67,7 +71,7 @@ public sealed class ServiceCompositionTests
     }
 
     [Fact]
-    public void ServiceAssemblyReferencesRestorationButNotRestorationWindows()
+    public void ServiceAssemblyReferencesRestorationAndStartupReconciliationAssembly()
     {
         var referenced = typeof(LibertyRouteRegistration).Assembly
             .GetReferencedAssemblies()
@@ -75,7 +79,7 @@ public sealed class ServiceCompositionTests
             .ToArray();
 
         Assert.Contains("LibertyRoute.Restoration", referenced);
-        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", referenced);
+        Assert.Contains("LibertyRoute.Restoration.Windows", referenced);
     }
 
     // --- DI composition ---
@@ -90,7 +94,7 @@ public sealed class ServiceCompositionTests
 
         Assert.Single(descriptors);
         Assert.Equal(ServiceLifetime.Singleton, descriptors[0].Lifetime);
-        Assert.Equal(typeof(FileOwnershipLedger), descriptors[0].ImplementationType);
+        Assert.NotNull(descriptors[0].ImplementationFactory);
     }
 
     [Fact]
@@ -347,6 +351,92 @@ public sealed class ServiceCompositionTests
         Assert.Equal(typeof(LibertyRouteWorker), hostedDescriptors[0].ImplementationType);
     }
 
+    [Theory]
+    [InlineData(RecoveryStartupReconciliationStatus.ManualRecoveryRequired)]
+    [InlineData(RecoveryStartupReconciliationStatus.MalformedJournal)]
+    [InlineData(RecoveryStartupReconciliationStatus.TerminalClearPending)]
+    public async Task UnresolvedD1bRuntimeStartupNeverStartsListener(
+        RecoveryStartupReconciliationStatus status)
+    {
+        var reconciler = new FixedStartupReconciler(status);
+        var controller = new ConnectionController(new InertNetwork(), new InertJournal(), new InertEngine());
+        var pipeFactory = new SecureControlPipeFactory(
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null));
+        var handler = new SecureControlConnectionHandler(
+            ControlServiceInstance.CreateTransient(), new ControlCommandAuthorization(),
+            new ControlRequestReplayGuard(TimeProvider.System), new InertDispatcher(),
+            NullLogger<SecureControlConnectionHandler>.Instance);
+        var worker = new LibertyRouteWorker(controller, pipeFactory, handler, reconciler,
+            NullLogger<LibertyRouteWorker>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            worker.StartAsync(CancellationToken.None));
+
+        Assert.Equal(1, reconciler.Calls);
+        Assert.Null(worker.ExecuteTask); // BackgroundService.StartAsync, and therefore ExecuteAsync/listener creation, was never reached.
+    }
+
+    [Theory]
+    [InlineData(RecoveryStartupReconciliationStatus.NoJournal)]
+    [InlineData(RecoveryStartupReconciliationStatus.ReconciledAndCleared)]
+    public async Task ResolvedRuntimeStartupReachesListenerBoundary(
+        RecoveryStartupReconciliationStatus status)
+    {
+        var worker = CreateRuntimeWorker(new ConnectionController(
+            new InertNetwork(), new EmptyJournal(), new InertEngine()),
+            new FixedStartupReconciler(status));
+        await worker.StartAsync(CancellationToken.None);
+        try { Assert.NotNull(worker.ExecuteTask); }
+        finally { await worker.StopAsync(CancellationToken.None); }
+    }
+
+    [Fact]
+    public async Task LegacyRuntimeRecoveryCompletesBeforeListenerBoundary()
+    {
+        var journal = new LegacyJournal();
+        var network = new LegacyNetwork();
+        var engine = new LegacyEngine();
+        var worker = CreateRuntimeWorker(new ConnectionController(network, journal, engine),
+            new FixedStartupReconciler(RecoveryStartupReconciliationStatus.LegacyRecoveryRequired));
+
+        await worker.StartAsync(CancellationToken.None);
+        try
+        {
+            Assert.Equal(1, engine.StopCalls);
+            Assert.Equal(1, network.VerifyCalls);
+            Assert.Equal(1, journal.ClearCalls);
+            Assert.NotNull(worker.ExecuteTask);
+        }
+        finally { await worker.StopAsync(CancellationToken.None); }
+    }
+
+    [Fact]
+    public async Task LegacyRuntimeRecoveryFailureNeverStartsListener()
+    {
+        var engine = new LegacyEngine { ThrowOnStop = true };
+        var worker = CreateRuntimeWorker(new ConnectionController(
+            new LegacyNetwork(), new LegacyJournal(), engine),
+            new FixedStartupReconciler(RecoveryStartupReconciliationStatus.LegacyRecoveryRequired));
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => worker.StartAsync(CancellationToken.None));
+        Assert.Equal(1, engine.StopCalls);
+        Assert.Null(worker.ExecuteTask);
+    }
+
+    private static LibertyRouteWorker CreateRuntimeWorker(
+        ConnectionController controller,
+        IRecoveryStartupReconciler reconciler)
+    {
+        var pipeFactory = new SecureControlPipeFactory(
+            new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null));
+        var handler = new SecureControlConnectionHandler(
+            ControlServiceInstance.CreateTransient(), new ControlCommandAuthorization(),
+            new ControlRequestReplayGuard(TimeProvider.System), new InertDispatcher(),
+            NullLogger<SecureControlConnectionHandler>.Instance);
+        return new LibertyRouteWorker(controller, pipeFactory, handler, reconciler,
+            NullLogger<LibertyRouteWorker>.Instance);
+    }
+
     [Fact]
     public void TransactionJournalIsRegisteredExactlyOnceAsSingletonFileImplementation()
     {
@@ -357,7 +447,7 @@ public sealed class ServiceCompositionTests
 
         Assert.Single(descriptors);
         Assert.Equal(ServiceLifetime.Singleton, descriptors[0].Lifetime);
-        Assert.Equal(typeof(FileTransactionJournal), descriptors[0].ImplementationType);
+        Assert.NotNull(descriptors[0].ImplementationFactory);
     }
 
     [Fact]
@@ -377,8 +467,93 @@ public sealed class ServiceCompositionTests
         // FileOwnershipLedger at a temporary directory.
         var productionLedger = Assert.Single(production, descriptor => descriptor.ServiceType == typeof(IOwnershipLedger));
         var testLedger = Assert.Single(test, descriptor => descriptor.ServiceType == typeof(IOwnershipLedger));
-        Assert.Equal(typeof(FileOwnershipLedger), productionLedger.ImplementationType);
+        Assert.Null(productionLedger.ImplementationType);
         Assert.Null(testLedger.ImplementationType);
+        Assert.NotNull(productionLedger.ImplementationFactory);
         Assert.NotNull(testLedger.ImplementationFactory);
+    }
+
+    private sealed class FixedStartupReconciler(RecoveryStartupReconciliationStatus status)
+        : IRecoveryStartupReconciler
+    {
+        internal int Calls { get; private set; }
+        public Task<RecoveryStartupReconciliationResult> ReconcileAsync(CancellationToken token)
+        {
+            Calls++;
+            return Task.FromResult(new RecoveryStartupReconciliationResult(
+                status, Guid.NewGuid(), Guid.NewGuid(), RecoveryPhase.ExecutionStarted,
+                false, "test unresolved state"));
+        }
+    }
+
+    private sealed class InertNetwork : INetworkStateManager
+    {
+        public Task<NetworkStateSnapshot> CaptureStateAsync(CancellationToken token) => throw new InvalidOperationException("legacy recovery is forbidden");
+        public Task VerifyRestorationAsync(NetworkStateSnapshot original, CancellationToken token) => throw new InvalidOperationException("legacy recovery is forbidden");
+    }
+
+    private sealed class InertJournal : ITransactionJournal
+    {
+        public string JournalPath => "worker-runtime-test";
+        public Task WriteAsync(NetworkTransaction transaction, CancellationToken token) => throw new InvalidOperationException("legacy recovery is forbidden");
+        public Task<NetworkTransaction?> ReadActiveAsync(CancellationToken token) => throw new InvalidOperationException("legacy recovery is forbidden");
+        public Task ClearAsync(Guid session, CancellationToken token) => throw new InvalidOperationException("legacy recovery is forbidden");
+    }
+
+    private sealed class EmptyJournal : ITransactionJournal
+    {
+        public string JournalPath => "worker-empty-test";
+        public Task<NetworkTransaction?> ReadActiveAsync(CancellationToken token) => Task.FromResult<NetworkTransaction?>(null);
+        public Task WriteAsync(NetworkTransaction transaction, CancellationToken token) => throw new NotSupportedException();
+        public Task ClearAsync(Guid session, CancellationToken token) => throw new NotSupportedException();
+    }
+
+    private sealed class LegacyJournal : ITransactionJournal
+    {
+        private NetworkTransaction? _transaction = new(Guid.NewGuid(), ConnectionState.RollbackRequired,
+            DateTimeOffset.UnixEpoch, new NetworkStateSnapshot(DateTimeOffset.UnixEpoch, "test",
+                Array.Empty<AdapterState>(), Array.Empty<RouteState>(), Array.Empty<DnsInterfaceState>()),
+            Array.Empty<OwnedNetworkChange>(), "legacy", null);
+        public string JournalPath => "worker-legacy-test";
+        internal int ClearCalls { get; private set; }
+        public Task<NetworkTransaction?> ReadActiveAsync(CancellationToken token) => Task.FromResult(_transaction);
+        public Task WriteAsync(NetworkTransaction transaction, CancellationToken token)
+        { _transaction = transaction; return Task.CompletedTask; }
+        public Task ClearAsync(Guid session, CancellationToken token)
+        { Assert.Equal(_transaction!.SessionId, session); ClearCalls++; _transaction = null; return Task.CompletedTask; }
+    }
+
+    private sealed class LegacyNetwork : INetworkStateManager
+    {
+        internal int VerifyCalls { get; private set; }
+        public Task<NetworkStateSnapshot> CaptureStateAsync(CancellationToken token) => throw new NotSupportedException();
+        public Task VerifyRestorationAsync(NetworkStateSnapshot original, CancellationToken token)
+        { VerifyCalls++; return Task.CompletedTask; }
+    }
+
+    private sealed class LegacyEngine : IConnectionEngine
+    {
+        public string Id => "legacy";
+        internal int StopCalls { get; private set; }
+        internal bool ThrowOnStop { get; init; }
+        public Task StartAsync(VpnServerConfig server, CancellationToken token) => throw new NotSupportedException();
+        public Task StopAsync(CancellationToken token)
+        { StopCalls++; return ThrowOnStop ? throw new InvalidOperationException("legacy failure") : Task.CompletedTask; }
+        public Task<bool> IsHealthyAsync(CancellationToken token) => Task.FromResult(true);
+    }
+
+    private sealed class InertEngine : IConnectionEngine
+    {
+        public string Id => "inert";
+        public Task StartAsync(VpnServerConfig server, CancellationToken token) => throw new InvalidOperationException("native execution is forbidden");
+        public Task StopAsync(CancellationToken token) => throw new InvalidOperationException("legacy recovery is forbidden");
+        public Task<bool> IsHealthyAsync(CancellationToken token) => throw new InvalidOperationException("native execution is forbidden");
+    }
+
+    private sealed class InertDispatcher : IControlCommandDispatcher
+    {
+        public Task<ControlDispatchResult> DispatchAsync(ControlCallerIdentity caller,
+            ControlRequestEnvelope request, CancellationToken token)
+            => throw new InvalidOperationException("listener must remain unreachable");
     }
 }
