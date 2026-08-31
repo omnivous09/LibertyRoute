@@ -265,6 +265,9 @@ public sealed class ControlRuntimeHardeningTests
 
         Assert.Contains(logger.Exceptions, exception =>
             exception is OperationCanceledException { Message: "registered disposal cancellation" });
+        var disposalLog = Assert.Single(logger.Entries,
+            entry => entry.Exception is OperationCanceledException { Message: "registered disposal cancellation" });
+        Assert.Equal(LogLevel.Error, disposalLog.Level);
         Assert.Equal(1, harness.Connection(1).DisposeCount);
         Assert.Equal(harness.CreatedCount, harness.AdmissionReleaseCount);
         Assert.Equal(0, server.ActiveTaskCount);
@@ -358,6 +361,31 @@ public sealed class ControlRuntimeHardeningTests
         await harness.WaitForIdleAsync();
         Assert.Equal(1, harness.Connection(1).DisposeCount);
         Assert.Equal(1, harness.Connection(2).DisposeCount);
+    }
+
+    [Fact]
+    public async Task RoutinePeerIOExceptionIsDebugWithoutExceptionOrStackFormatting()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 1);
+        var logger = new RecordingLogger();
+        var server = harness.ServerWithAdmission((_, _, _) =>
+        {
+            harness.RecordHandled();
+            throw new IOException("attacker-controlled-transport-detail");
+        }, logger: logger);
+        using var cancellation = new CancellationTokenSource();
+        var run = server.RunAsync(cancellation.Token);
+
+        await harness.WaitForHandledAsync(1);
+        await harness.WaitForIdleAsync();
+        cancellation.Cancel();
+        await run;
+
+        var entry = Assert.Single(logger.Entries);
+        Assert.Equal(LogLevel.Debug, entry.Level);
+        Assert.Null(entry.Exception);
+        Assert.Contains(nameof(IOException), entry.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("attacker-controlled-transport-detail", entry.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -704,15 +732,17 @@ public sealed class ControlRuntimeHardeningTests
     private sealed class RecordingLogger : ILogger
     {
         private readonly object _sync = new();
-        private readonly List<Exception> _exceptions = new();
-        internal IReadOnlyList<Exception> Exceptions { get { lock (_sync) return _exceptions.ToArray(); } }
+        private readonly List<(LogLevel Level, string Message, Exception? Exception)> _entries = new();
+        internal IReadOnlyList<(LogLevel Level, string Message, Exception? Exception)> Entries
+        { get { lock (_sync) return _entries.ToArray(); } }
+        internal IReadOnlyList<Exception> Exceptions
+        { get { lock (_sync) return _entries.Where(entry => entry.Exception is not null).Select(entry => entry.Exception!).ToArray(); } }
         public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
         public bool IsEnabled(LogLevel logLevel) => true;
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
             Func<TState, Exception?, string> formatter)
         {
-            if (exception is not null)
-                lock (_sync) _exceptions.Add(exception);
+            lock (_sync) _entries.Add((logLevel, formatter(state, exception), exception));
         }
     }
 }

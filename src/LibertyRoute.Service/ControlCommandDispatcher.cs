@@ -8,13 +8,23 @@ namespace LibertyRoute.Service;
 internal sealed class ControlCommandDispatcher : IControlCommandDispatcher
 {
     private readonly ConnectionController _controller;
+    private readonly ControlSecurityLogLimiter _securityLogs;
     private readonly ILogger<ControlCommandDispatcher> _logger;
 
     public ControlCommandDispatcher(
         ConnectionController controller,
         ILogger<ControlCommandDispatcher>? logger = null)
+        : this(controller, new ControlSecurityLogLimiter(TimeProvider.System), logger)
+    {
+    }
+
+    public ControlCommandDispatcher(
+        ConnectionController controller,
+        ControlSecurityLogLimiter securityLogs,
+        ILogger<ControlCommandDispatcher>? logger = null)
     {
         _controller = controller ?? throw new ArgumentNullException(nameof(controller));
+        _securityLogs = securityLogs ?? throw new ArgumentNullException(nameof(securityLogs));
         _logger = logger ?? NullLogger<ControlCommandDispatcher>.Instance;
     }
 
@@ -87,7 +97,7 @@ internal sealed class ControlCommandDispatcher : IControlCommandDispatcher
     {
         if (!caller.IsBuiltinAdministrator && !caller.IsLocalSystem)
         {
-            _logger.LogWarning(
+            _logger.LogDebug(
                 "Snapshot denied for request {RequestId}: caller is not an administrator or LocalSystem.",
                 request.RequestId);
             return new ControlDispatchResult(
@@ -108,7 +118,19 @@ internal sealed class ControlCommandDispatcher : IControlCommandDispatcher
         ControlRequestEnvelope request,
         CancellationToken cancellationToken)
     {
-        var transaction = await _controller.BeginSafeConnectAsync(caller.UserSid, cancellationToken);
+        NetworkTransaction transaction;
+        try
+        {
+            transaction = await _controller.BeginSafeConnectForDispatchAsync(caller.UserSid, cancellationToken);
+        }
+        catch (ConnectionCommandRejectedException exception)
+        {
+            _logger.LogDebug(
+                "Request {RequestId} command Connect was rejected with {Reason}.",
+                request.RequestId,
+                exception.Reason);
+            return new ControlDispatchResult(ControlOutcome.Failed, ControlErrorCode.InternalError, null);
+        }
         return new ControlDispatchResult(
             ControlOutcome.Succeeded,
             ControlErrorCode.None,
@@ -166,7 +188,7 @@ internal sealed class ControlCommandDispatcher : IControlCommandDispatcher
         switch (authResult.Decision)
         {
             case SessionAuthorizationDecision.OwnerAuthorized:
-                _logger.LogInformation(
+                _logger.LogDebug(
                     "Request {RequestId} command {Command} authorized for session {SessionId}: OwnerAuthorized.",
                     requestId,
                     command,
@@ -174,7 +196,7 @@ internal sealed class ControlCommandDispatcher : IControlCommandDispatcher
                 break;
 
             case SessionAuthorizationDecision.OperationalOverrideAuthorized:
-                _logger.LogInformation(
+                _logger.LogDebug(
                     "Request {RequestId} command {Command} authorized for session {SessionId}: OperationalOverrideAuthorized.",
                     requestId,
                     command,
@@ -182,7 +204,7 @@ internal sealed class ControlCommandDispatcher : IControlCommandDispatcher
                 break;
 
             case SessionAuthorizationDecision.ForeignOwnerDenied:
-                _logger.LogWarning(
+                _logger.LogDebug(
                     "Request {RequestId} command {Command} denied for session {SessionId}: ForeignOwnerDenied.",
                     requestId,
                     command,
@@ -190,27 +212,19 @@ internal sealed class ControlCommandDispatcher : IControlCommandDispatcher
                 break;
 
             case SessionAuthorizationDecision.LegacyOwnerDenied:
-                _logger.LogWarning(
-                    "Request {RequestId} command {Command} denied for session {SessionId}: LegacyOwnerDenied.",
-                    requestId,
-                    command,
-                    authResult.SessionId);
+                LogLimitedWarning(requestId, command, authResult, "LegacyOwnerDenied");
                 break;
 
             case SessionAuthorizationDecision.InvalidOwnerDenied:
-                _logger.LogWarning(
-                    "Request {RequestId} command {Command} denied for session {SessionId}: InvalidOwnerDenied.",
-                    requestId,
-                    command,
-                    authResult.SessionId);
+                LogLimitedWarning(requestId, command, authResult, "InvalidOwnerDenied");
                 break;
 
             case SessionAuthorizationDecision.InconsistentStateDenied:
-                _logger.LogError(
-                    "Request {RequestId} command {Command} denied for session {SessionId}: InconsistentStateDenied.",
-                    requestId,
-                    command,
-                    authResult.SessionId);
+                var decision = _securityLogs.TryAdmit();
+                if (decision.IsAdmitted)
+                    _logger.LogError(
+                        "Request {RequestId} command {Command} denied for session {SessionId}: InconsistentStateDenied. Prior client security events suppressed: {PriorSuppressedCount}.",
+                        requestId, command, authResult.SessionId, decision.PriorSuppressedCount);
                 break;
 
             case SessionAuthorizationDecision.NoActiveSession:
@@ -220,6 +234,19 @@ internal sealed class ControlCommandDispatcher : IControlCommandDispatcher
                     command);
                 break;
         }
+    }
+
+    private void LogLimitedWarning(
+        Guid requestId,
+        ControlCommand command,
+        SessionAuthorizationResult authResult,
+        string reason)
+    {
+        var decision = _securityLogs.TryAdmit();
+        if (decision.IsAdmitted)
+            _logger.LogWarning(
+                "Request {RequestId} command {Command} denied for session {SessionId}: {Reason}. Prior client security events suppressed: {PriorSuppressedCount}.",
+                requestId, command, authResult.SessionId, reason, decision.PriorSuppressedCount);
     }
 
     internal static ControlConnectionState MapState(ConnectionState state) => state switch

@@ -144,3 +144,52 @@ internal sealed class ControlServiceInstance
     internal static ControlServiceInstance CreateTransient()
         => new(Guid.NewGuid());
 }
+
+internal readonly record struct ControlSecurityLogDecision(bool IsAdmitted, int PriorSuppressedCount);
+
+internal sealed class ControlSecurityLogLimiter
+{
+    internal const int EventBudget = 8;
+    internal static readonly TimeSpan Window = TimeSpan.FromMinutes(1);
+
+    private readonly object _sync = new();
+    private readonly TimeProvider _timeProvider;
+    private DateTimeOffset _windowStart;
+    private int _admitted;
+    private int _suppressed;
+    private int _carriedSuppressed;
+
+    internal ControlSecurityLogLimiter(TimeProvider timeProvider)
+    {
+        _timeProvider = timeProvider ?? throw new ArgumentNullException(nameof(timeProvider));
+        _windowStart = _timeProvider.GetUtcNow();
+    }
+
+    internal ControlSecurityLogDecision TryAdmit()
+    {
+        lock (_sync)
+        {
+            var now = _timeProvider.GetUtcNow();
+            if (now >= _windowStart + Window)
+            {
+                var elapsedTicks = (now - _windowStart).Ticks;
+                var completeWindows = Math.Max(1, elapsedTicks / Window.Ticks);
+                _windowStart = _windowStart.AddTicks(completeWindows * Window.Ticks);
+                _carriedSuppressed = _suppressed;
+                _suppressed = 0;
+                _admitted = 0;
+            }
+
+            if (_admitted >= EventBudget)
+            {
+                _suppressed++;
+                return new ControlSecurityLogDecision(false, 0);
+            }
+
+            _admitted++;
+            var priorSuppressed = _carriedSuppressed;
+            _carriedSuppressed = 0;
+            return new ControlSecurityLogDecision(true, priorSuppressed);
+        }
+    }
+}

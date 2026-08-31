@@ -17,6 +17,18 @@ internal enum SessionAuthorizationDecision
     InconsistentStateDenied
 }
 
+internal enum ConnectionCommandRejectionReason
+{
+    ActiveTransaction,
+    UnfinishedTransaction
+}
+
+internal sealed class ConnectionCommandRejectedException(ConnectionCommandRejectionReason reason)
+    : Exception("The connection command was rejected by the current durable session state.")
+{
+    internal ConnectionCommandRejectionReason Reason { get; } = reason;
+}
+
 internal sealed record SessionAuthorizationResult(
     SessionAuthorizationDecision Decision,
     ConnectionState State,
@@ -60,18 +72,35 @@ public sealed class ConnectionController
         string? ownerSid,
         CancellationToken cancellationToken)
     {
+        try
+        {
+            return await BeginSafeConnectForDispatchAsync(ownerSid, cancellationToken);
+        }
+        catch (ConnectionCommandRejectedException)
+        {
+            // Preserve the established direct-controller contract while the
+            // protocol boundary consumes the fixed rejection reason below.
+            throw new InvalidOperationException(
+                "The connection command was rejected by the current durable session state.");
+        }
+    }
+
+    internal async Task<NetworkTransaction> BeginSafeConnectForDispatchAsync(
+        string? ownerSid,
+        CancellationToken cancellationToken)
+    {
         var canonicalOwnerSid = WindowsControlCallerIdentityCapture.CanonicalizeUserSid(ownerSid);
         await _networkLock.WaitAsync(cancellationToken);
         try
         {
             if (_active is not null)
-                throw new InvalidOperationException("A LibertyRoute network transaction is already active.");
+                throw new ConnectionCommandRejectedException(ConnectionCommandRejectionReason.ActiveTransaction);
 
             var existing = await _journal.ReadActiveAsync(cancellationToken);
             if (existing is not null)
             {
                 ValidatePersistedOwner(existing);
-                throw new InvalidOperationException("An unfinished session exists and must be recovered before connecting.");
+                throw new ConnectionCommandRejectedException(ConnectionCommandRejectionReason.UnfinishedTransaction);
             }
 
             var snapshot = await _network.CaptureStateAsync(cancellationToken);

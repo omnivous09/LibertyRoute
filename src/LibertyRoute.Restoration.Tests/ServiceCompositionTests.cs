@@ -166,51 +166,33 @@ public sealed class ServiceCompositionTests
     }
 
     [Fact]
-    public async Task RecordedMutationExecutorFactoryIsRegisteredExactlyOnceInProductionAndTestComposition()
+    public async Task RecordedMutationExecutorFactoryIsAbsentFromProductionAndTestComposition()
     {
-        var productionRoot = Path.Combine(Path.GetTempPath(), "LibertyRoute.Tests.Composition", Guid.NewGuid().ToString("N"));
         var testRoot = Path.Combine(Path.GetTempPath(), "LibertyRoute.Tests.Composition", Guid.NewGuid().ToString("N"));
         try
         {
             var productionServices = new ServiceCollection();
             productionServices.AddLibertyRouteCoreServices();
-            var productionDescriptor = Assert.Single(
-                productionServices,
-                descriptor => descriptor.ServiceType == typeof(IRecordedMutationExecutorFactory));
-            Assert.Equal(typeof(RecordedMutationExecutorFactory), productionDescriptor.ImplementationType);
-
-            // Redirect only the ledger storage so resolving the production composition
-            // cannot touch the real ProgramData location during this test.
-            productionServices.Remove(Assert.Single(
-                productionServices,
-                descriptor => descriptor.ServiceType == typeof(IOwnershipLedger)));
-            productionServices.AddSingleton<IOwnershipLedger>(_ => new FileOwnershipLedger(productionRoot));
-
             var testServices = new ServiceCollection();
             testServices.AddLibertyRouteCoreServicesForTests(testRoot);
-            var testDescriptor = Assert.Single(
-                testServices,
+
+            Assert.DoesNotContain(productionServices,
                 descriptor => descriptor.ServiceType == typeof(IRecordedMutationExecutorFactory));
-            Assert.Equal(typeof(RecordedMutationExecutorFactory), testDescriptor.ImplementationType);
+            Assert.DoesNotContain(testServices,
+                descriptor => descriptor.ServiceType == typeof(IRecordedMutationExecutorFactory));
 
-            await using var productionProvider = productionServices.BuildServiceProvider();
             await using var testProvider = testServices.BuildServiceProvider();
-
-            Assert.IsType<RecordedMutationExecutorFactory>(
-                productionProvider.GetRequiredService<IRecordedMutationExecutorFactory>());
-            Assert.IsType<RecordedMutationExecutorFactory>(
+            Assert.Null(testProvider.GetService<IRecordedMutationExecutorFactory>());
+            Assert.Throws<InvalidOperationException>(() =>
                 testProvider.GetRequiredService<IRecordedMutationExecutorFactory>());
-
-            Assert.Empty(Directory.GetFiles(productionRoot, "*.lrw", SearchOption.AllDirectories));
-            Assert.Empty(Directory.GetFiles(testRoot, "*.lrw", SearchOption.AllDirectories));
-            Assert.Throws<InvalidOperationException>(
-                () => productionProvider.GetRequiredService<IRestorationMutationProvider>());
+            if (Directory.Exists(testRoot))
+                Assert.Empty(Directory.GetFiles(testRoot, "*.lrw", SearchOption.AllDirectories));
             Assert.Throws<InvalidOperationException>(
                 () => testProvider.GetRequiredService<IRestorationMutationProvider>());
         }
         finally
         {
-            foreach (var root in new[] { productionRoot, testRoot })
+            foreach (var root in new[] { testRoot })
             {
                 try
                 {
@@ -221,6 +203,74 @@ public sealed class ServiceCompositionTests
                 }
             }
         }
+    }
+
+    [Fact]
+    public void RequiredRuntimeRegistrationsRemainExactAndLimiterIsSingleton()
+    {
+        var services = new ServiceCollection();
+        services.AddLibertyRouteCoreServices();
+
+        foreach (var type in new[]
+        {
+            typeof(ConnectionController), typeof(IRecoveryStartupReconciler),
+            typeof(SecureControlConnectionHandler), typeof(ControlSecurityLogLimiter)
+        })
+            Assert.Single(services, descriptor => descriptor.ServiceType == type);
+
+        var limiter = Assert.Single(services,
+            descriptor => descriptor.ServiceType == typeof(ControlSecurityLogLimiter));
+        Assert.Equal(ServiceLifetime.Singleton, limiter.Lifetime);
+        Assert.Single(services, descriptor => descriptor.ServiceType == typeof(IHostedService));
+    }
+
+    [Fact]
+    public async Task RequiredRuntimeGraphResolvesWithoutRemovedMutationCapability()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "LibertyRoute.Tests.Composition", Guid.NewGuid().ToString("N"));
+        try
+        {
+            var services = new ServiceCollection();
+            services.AddLibertyRouteCoreServicesForTests(root);
+            services.AddLogging();
+            await using var provider = services.BuildServiceProvider(
+                new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true });
+
+            Assert.NotNull(provider.GetRequiredService<ConnectionController>());
+            Assert.NotNull(provider.GetRequiredService<IRecoveryStartupReconciler>());
+            var handler = provider.GetRequiredService<SecureControlConnectionHandler>();
+            var dispatcher = Assert.IsType<ControlCommandDispatcher>(
+                provider.GetRequiredService<IControlCommandDispatcher>());
+            Assert.IsType<LibertyRouteWorker>(provider.GetServices<IHostedService>().Single());
+            var limiter = provider.GetRequiredService<ControlSecurityLogLimiter>();
+            Assert.Same(limiter, provider.GetRequiredService<ControlSecurityLogLimiter>());
+            Assert.Same(limiter, typeof(SecureControlConnectionHandler)
+                .GetField("_securityLogs", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(handler));
+            Assert.Same(limiter, typeof(ControlCommandDispatcher)
+                .GetField("_securityLogs", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(dispatcher));
+            Assert.Null(provider.GetService<IRecordedMutationExecutorFactory>());
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ServiceProductionSourceHasNoMutationFactoryOrServiceLocatorFallback()
+    {
+        var registration = ReadSource("src", "LibertyRoute.Service", "ServiceRegistration.cs");
+        var production = ProductionSourcesExcludingRestoration()
+            .Select(File.ReadAllText)
+            .ToArray();
+
+        Assert.DoesNotContain("IRecordedMutationExecutorFactory", registration, StringComparison.Ordinal);
+        Assert.All(production, source =>
+        {
+            Assert.DoesNotContain("IServiceProvider", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("ActivatorUtilities", source, StringComparison.Ordinal);
+            Assert.DoesNotContain("CreateScope", source, StringComparison.Ordinal);
+        });
     }
 
     // --- Constructor dependency guards ---

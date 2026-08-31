@@ -186,6 +186,12 @@ internal sealed class BoundedControlPipeServer
                 exception.CancellationToken == _transportStop.Token && _transportStop.IsCancellationRequested)
             {
             }
+            catch (IOException exception)
+            {
+                _logger.LogDebug(
+                    "Secure control client transport terminated with fixed exception type {TransportExceptionType}.",
+                    exception.GetType().Name);
+            }
             catch (Exception exception)
             {
                 _logger.LogError(exception, "Secure control client handling failed.");

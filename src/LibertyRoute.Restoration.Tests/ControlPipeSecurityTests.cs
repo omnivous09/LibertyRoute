@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using System.Collections.Concurrent;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text.Json;
@@ -145,6 +146,96 @@ public sealed class ControlPipeSecurityTests
     {
         var guard = new ControlRequestReplayGuard(new MutableTimeProvider(Now));
         Assert.Equal(expected, guard.EvaluateFreshness(Now.AddSeconds(seconds)).ToString());
+    }
+
+    [Fact]
+    public void ClientSecurityLogLimiterHasExactWindowSuppressionAndBoundarySemantics()
+    {
+        var time = new MutableTimeProvider(Now);
+        var limiter = new ControlSecurityLogLimiter(time);
+
+        for (var index = 0; index < ControlSecurityLogLimiter.EventBudget; index++)
+            Assert.Equal(new ControlSecurityLogDecision(true, 0), limiter.TryAdmit());
+        Assert.False(limiter.TryAdmit().IsAdmitted);
+        Assert.False(limiter.TryAdmit().IsAdmitted);
+
+        time.UtcNow += ControlSecurityLogLimiter.Window;
+        Assert.Equal(new ControlSecurityLogDecision(true, 2), limiter.TryAdmit());
+        Assert.Equal(new ControlSecurityLogDecision(true, 0), limiter.TryAdmit());
+
+        for (var index = 2; index < ControlSecurityLogLimiter.EventBudget; index++)
+            Assert.True(limiter.TryAdmit().IsAdmitted);
+        Assert.False(limiter.TryAdmit().IsAdmitted);
+        time.UtcNow += ControlSecurityLogLimiter.Window * 3;
+        Assert.Equal(new ControlSecurityLogDecision(true, 1), limiter.TryAdmit());
+    }
+
+    [Fact]
+    public void ClientSecurityLogLimiterConcurrencyCannotExceedBudget()
+    {
+        var limiter = new ControlSecurityLogLimiter(new MutableTimeProvider(Now));
+        var decisions = new ConcurrentBag<ControlSecurityLogDecision>();
+
+        Parallel.For(0, 64, _ => decisions.Add(limiter.TryAdmit()));
+
+        Assert.Equal(ControlSecurityLogLimiter.EventBudget, decisions.Count(item => item.IsAdmitted));
+        Assert.Equal(64 - ControlSecurityLogLimiter.EventBudget, decisions.Count(item => !item.IsAdmitted));
+    }
+
+    [Fact]
+    public void ClientSecurityLogLimiterBackwardClockDoesNotReopenBudget()
+    {
+        var time = new MutableTimeProvider(Now);
+        var limiter = new ControlSecurityLogLimiter(time);
+        for (var index = 0; index < ControlSecurityLogLimiter.EventBudget; index++)
+            Assert.True(limiter.TryAdmit().IsAdmitted);
+
+        time.UtcNow -= TimeSpan.FromDays(1);
+
+        Assert.False(limiter.TryAdmit().IsAdmitted);
+        Assert.False(limiter.TryAdmit().IsAdmitted);
+    }
+
+    [Fact]
+    public async Task MalformedFramingLogsOneFixedDebugReasonWithoutExceptionOrPayload()
+    {
+        var logger = new TestLogger<SecureControlConnectionHandler>();
+        const string attackerPayload = "attacker-controlled-payload";
+        var input = BitConverter.GetBytes(-1)
+            .Concat(System.Text.Encoding.UTF8.GetBytes(attackerPayload))
+            .ToArray();
+        var handler = Handler(new FakeDispatcher(), logger: logger);
+
+        await handler.HandleAuthenticatedForTestsAsync(
+            new DuplexStream(input), Caller("S-1-5-21-1"), CancellationToken.None);
+
+        var diagnostic = Assert.Single(logger.Logs);
+        Assert.Equal(LogLevel.Debug, diagnostic.Level);
+        Assert.Null(diagnostic.Exception);
+        Assert.Contains(nameof(ControlProtocolError.InvalidLengthPrefix), diagnostic.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(attackerPayload, diagnostic.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PrincipalSecurityWarningsAreGloballyLimitedAndSurfaceSuppressionCount()
+    {
+        var time = new MutableTimeProvider(Now);
+        var limiter = new ControlSecurityLogLimiter(time);
+        var logger = new TestLogger<SecureControlConnectionHandler>();
+        var handler = Handler(new FakeDispatcher(), transportTimeProvider: time, logger: logger, securityLogs: limiter);
+
+        for (var index = 0; index < ControlSecurityLogLimiter.EventBudget + 3; index++)
+            await handler.HandleAuthenticatedForTestsAsync(
+                new DuplexStream(Array.Empty<byte>()),
+                Caller("S-1-5-21-1", authenticated: false), CancellationToken.None);
+
+        Assert.Equal(ControlSecurityLogLimiter.EventBudget, logger.Logs.Count);
+        Assert.All(logger.Logs, entry => Assert.Equal(LogLevel.Warning, entry.Level));
+        time.UtcNow += ControlSecurityLogLimiter.Window;
+        await handler.HandleAuthenticatedForTestsAsync(
+            new DuplexStream(Array.Empty<byte>()),
+            Caller("S-1-5-21-1", authenticated: false), CancellationToken.None);
+        Assert.Contains("suppressed: 3", logger.Logs.Last().Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1173,14 +1264,17 @@ public sealed class ControlPipeSecurityTests
         IControlCommandDispatcher dispatcher,
         ControlRequestReplayGuard? replayGuard = null,
         ControlCommandAuthorization? authorization = null,
-        TimeProvider? transportTimeProvider = null)
+        TimeProvider? transportTimeProvider = null,
+        ILogger<SecureControlConnectionHandler>? logger = null,
+        ControlSecurityLogLimiter? securityLogs = null)
         => new(
             new ControlServiceInstance(InstanceId),
             authorization ?? new ControlCommandAuthorization(),
             replayGuard ?? new ControlRequestReplayGuard(new MutableTimeProvider(Now)),
             dispatcher,
             transportTimeProvider ?? TimeProvider.System,
-            NullLogger<SecureControlConnectionHandler>.Instance);
+            securityLogs ?? new ControlSecurityLogLimiter(transportTimeProvider ?? TimeProvider.System),
+            logger ?? NullLogger<SecureControlConnectionHandler>.Instance);
 
     private static async Task<ControlResponseEnvelope?> InvokeAsync(
         SecureControlConnectionHandler handler,
@@ -1406,6 +1500,82 @@ public sealed class ControlPipeSecurityTests
             public void Dispose() => Active = false;
             public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
         }
+    }
+
+    [Fact]
+    public async Task ExpectedConnectConflictIsDebugWithoutExceptionStack()
+    {
+        var controller = new ConnectionController(
+            new FakeNetworkStateManager(DiagnosticSnapshot()), new FakeTransactionJournal(), new FakeConnectionEngine());
+        var logger = new TestLogger<ControlCommandDispatcher>();
+        var dispatcher = new ControlCommandDispatcher(
+            controller, new ControlSecurityLogLimiter(new MutableTimeProvider(Now)), logger);
+        var caller = Caller("S-1-5-21-1001");
+        var request = Request() with { Command = ControlCommand.Connect };
+
+        Assert.Equal(ControlOutcome.Succeeded,
+            (await dispatcher.DispatchAsync(caller, request, CancellationToken.None)).Outcome);
+        var rejected = await dispatcher.DispatchAsync(caller, request with { RequestId = Guid.NewGuid() }, CancellationToken.None);
+
+        Assert.Equal(ControlOutcome.Failed, rejected.Outcome);
+        Assert.Equal(ControlErrorCode.InternalError, rejected.ErrorCode);
+        var entry = Assert.Single(logger.Logs, log => log.Message.Contains("ActiveTransaction", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Debug, entry.Level);
+        Assert.Null(entry.Exception);
+    }
+
+    [Fact]
+    public async Task RoutineForeignOwnerDenialIsDebugButInconsistentStateIsLimitedError()
+    {
+        var journal = new FakeTransactionJournal();
+        var controller = new ConnectionController(
+            new FakeNetworkStateManager(DiagnosticSnapshot()), journal, new FakeConnectionEngine());
+        var logger = new TestLogger<ControlCommandDispatcher>();
+        var limiter = new ControlSecurityLogLimiter(new MutableTimeProvider(Now));
+        var dispatcher = new ControlCommandDispatcher(controller, limiter, logger);
+        var owner = Caller("S-1-5-21-1001", administrator: false);
+        var foreign = Caller("S-1-5-21-1002", administrator: false);
+        await dispatcher.DispatchAsync(owner, Request() with { Command = ControlCommand.Connect }, CancellationToken.None);
+
+        await dispatcher.DispatchAsync(foreign, Request(), CancellationToken.None);
+        var foreignLog = Assert.Single(logger.Logs,
+            log => log.Message.Contains("ForeignOwnerDenied", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Debug, foreignLog.Level);
+        Assert.Null(foreignLog.Exception);
+
+        journal.Active = null;
+        await dispatcher.DispatchAsync(owner, Request(), CancellationToken.None);
+        var inconsistent = Assert.Single(logger.Logs,
+            log => log.Message.Contains("InconsistentStateDenied", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Error, inconsistent.Level);
+        Assert.Null(inconsistent.Exception);
+    }
+
+    [Fact]
+    public async Task UnexpectedDispatchErrorsAreGloballyLimitedAndReplayRejectionAddsNoWarning()
+    {
+        var time = new MutableTimeProvider(Now);
+        var limiter = new ControlSecurityLogLimiter(time);
+        var logger = new TestLogger<SecureControlConnectionHandler>();
+        var dispatcher = new FakeDispatcher { Exception = new IOException("bounded-sensitive-detail") };
+        var handler = Handler(dispatcher, logger: logger, securityLogs: limiter);
+
+        for (var index = 0; index < ControlSecurityLogLimiter.EventBudget + 2; index++)
+            _ = await InvokeAsync(handler, Request(), Caller("S-1-5-21-1"));
+
+        Assert.Equal(ControlSecurityLogLimiter.EventBudget, logger.Logs.Count);
+        Assert.All(logger.Logs, entry => Assert.Equal(LogLevel.Error, entry.Level));
+
+        dispatcher.Exception = null;
+        var replayGuard = new ControlRequestReplayGuard(time);
+        var replayLogger = new TestLogger<SecureControlConnectionHandler>();
+        var replayHandler = Handler(dispatcher, replayGuard, logger: replayLogger,
+            securityLogs: new ControlSecurityLogLimiter(time));
+        var replayRequest = Request();
+        _ = await InvokeAsync(replayHandler, replayRequest, Caller("S-1-5-21-1"));
+        _ = await InvokeAsync(replayHandler, replayRequest, Caller("S-1-5-21-1"));
+        Assert.DoesNotContain(replayLogger.Logs,
+            entry => entry.Level is LogLevel.Warning or LogLevel.Error or LogLevel.Critical);
     }
 
     private sealed class FakeNetworkStateManager(NetworkStateSnapshot snapshot) : INetworkStateManager

@@ -22,21 +22,36 @@ internal sealed class SecureControlConnectionHandler
     private readonly ControlCommandAuthorization _authorization;
     private readonly ControlRequestReplayGuard _replayGuard;
     private readonly IControlCommandDispatcher _dispatcher;
+    private readonly ControlSecurityLogLimiter _securityLogs;
     private readonly ControlTransportDeadlinePolicy _deadlines;
     private readonly ILogger<SecureControlConnectionHandler> _logger;
 
-    internal SecureControlConnectionHandler(
+    public SecureControlConnectionHandler(
         ControlServiceInstance serviceInstance,
         ControlCommandAuthorization authorization,
         ControlRequestReplayGuard replayGuard,
         IControlCommandDispatcher dispatcher,
         TimeProvider timeProvider,
         ILogger<SecureControlConnectionHandler> logger)
+        : this(serviceInstance, authorization, replayGuard, dispatcher, timeProvider,
+            new ControlSecurityLogLimiter(timeProvider), logger)
+    {
+    }
+
+    public SecureControlConnectionHandler(
+        ControlServiceInstance serviceInstance,
+        ControlCommandAuthorization authorization,
+        ControlRequestReplayGuard replayGuard,
+        IControlCommandDispatcher dispatcher,
+        TimeProvider timeProvider,
+        ControlSecurityLogLimiter securityLogs,
+        ILogger<SecureControlConnectionHandler> logger)
     {
         _serviceInstance = serviceInstance ?? throw new ArgumentNullException(nameof(serviceInstance));
         _authorization = authorization ?? throw new ArgumentNullException(nameof(authorization));
         _replayGuard = replayGuard ?? throw new ArgumentNullException(nameof(replayGuard));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+        _securityLogs = securityLogs ?? throw new ArgumentNullException(nameof(securityLogs));
         _deadlines = new ControlTransportDeadlinePolicy(timeProvider);
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
@@ -73,7 +88,11 @@ internal sealed class SecureControlConnectionHandler
         var principalDecision = _authorization.AuthorizePrincipal(caller);
         if (principalDecision != ControlAuthorizationDecision.Authorized)
         {
-            _logger.LogWarning("Control caller {CallerSid} was rejected with {Decision}.", caller.UserSid, principalDecision);
+            var decision = _securityLogs.TryAdmit();
+            if (decision.IsAdmitted)
+                _logger.LogWarning(
+                    "Control caller {CallerSid} was rejected with {Decision}. Prior client security events suppressed: {PriorSuppressedCount}.",
+                    caller.UserSid, principalDecision, decision.PriorSuppressedCount);
             return;
         }
 
@@ -98,7 +117,7 @@ internal sealed class SecureControlConnectionHandler
         catch (ControlTransportDeadlineException) { return; }
         catch (ControlProtocolException exception)
         {
-            _logger.LogWarning("Control request was rejected with {ProtocolError}.", exception.Error);
+            _logger.LogDebug("Control request was rejected with fixed protocol reason {ProtocolError}.", exception.Error);
             return;
         }
 
@@ -153,12 +172,22 @@ internal sealed class SecureControlConnectionHandler
         }
         catch (Exception exception)
         {
-            _logger.LogError(
-                exception,
-                "Control dispatch failed for instance {ServiceInstanceId}, request {RequestId}, command {Command}.",
-                _serviceInstance.Id,
-                request.RequestId,
-                request.Command);
+            if (request.Command is ControlCommand.Connect or ControlCommand.Disconnect)
+            {
+                _logger.LogError(
+                    exception,
+                    "State-changing control dispatch failed for instance {ServiceInstanceId}, request {RequestId}, command {Command}; durable safety evidence may require attention.",
+                    _serviceInstance.Id, request.RequestId, request.Command);
+            }
+            else
+            {
+                var decision = _securityLogs.TryAdmit();
+                if (decision.IsAdmitted)
+                    _logger.LogError(
+                        exception,
+                        "Control dispatch failed for instance {ServiceInstanceId}, request {RequestId}, command {Command}. Prior client security events suppressed: {PriorSuppressedCount}.",
+                        _serviceInstance.Id, request.RequestId, request.Command, decision.PriorSuppressedCount);
+            }
             result = new(ControlOutcome.Failed, ControlErrorCode.InternalError, null);
         }
 
