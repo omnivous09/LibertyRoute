@@ -41,22 +41,34 @@ internal sealed class SecureControlConnectionHandler
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
-    internal async Task HandleAsync(NamedPipeServerStream server, CancellationToken cancellationToken)
+    internal async Task HandleAsync(
+        NamedPipeServerStream server,
+        IControlCommandAdmission commandAdmission,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(server);
         cancellationToken.ThrowIfCancellationRequested();
         var caller = WindowsControlCallerIdentityCapture.Capture(server);
         cancellationToken.ThrowIfCancellationRequested();
-        await HandleAuthenticatedForTestsAsync(server, caller, cancellationToken);
+        await HandleAuthenticatedAsync(server, caller, commandAdmission, cancellationToken);
     }
 
     internal async Task HandleAuthenticatedForTestsAsync(
         Stream stream,
         ControlCallerIdentity caller,
         CancellationToken cancellationToken)
+        => await HandleAuthenticatedAsync(
+            stream, caller, BoundedControlPipeServer.AlwaysOpenCommandAdmission.Instance, cancellationToken);
+
+    internal async Task HandleAuthenticatedAsync(
+        Stream stream,
+        ControlCallerIdentity caller,
+        IControlCommandAdmission commandAdmission,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(caller);
+        ArgumentNullException.ThrowIfNull(commandAdmission);
 
         var principalDecision = _authorization.AuthorizePrincipal(caller);
         if (principalDecision != ControlAuthorizationDecision.Authorized)
@@ -107,6 +119,9 @@ internal sealed class SecureControlConnectionHandler
             await WriteFailureAsync(stream, request, ControlErrorCode.ForbiddenCommand, cancellationToken);
             return;
         }
+
+        if (!commandAdmission.TryAdmit())
+            return;
 
         var replay = await _replayGuard.ReserveAsync(caller, request, cancellationToken);
         var replayError = replay switch

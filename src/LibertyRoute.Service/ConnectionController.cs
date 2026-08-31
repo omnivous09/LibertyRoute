@@ -86,7 +86,8 @@ public sealed class ConnectionController
                 canonicalOwnerSid);
 
             // Critical invariant: persist the rollback state before any network mutation.
-            await _journal.WriteAsync(transaction, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            await _journal.WriteAsync(transaction, CancellationToken.None);
             _active = transaction;
             return transaction;
         }
@@ -262,28 +263,28 @@ public sealed class ConnectionController
         string? reason,
         CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
             tx = tx with { State = ConnectionState.RollingBack, LastError = reason };
-            await _journal.WriteAsync(tx, cancellationToken);
+            await _journal.WriteAsync(tx, CancellationToken.None);
+            _active = tx;
 
             // Phase 1 creates no privileged network changes, so rollback consists of
             // proving the captured baseline is still observable.
-            await _engine.StopAsync(cancellationToken);
-            await _network.VerifyRestorationAsync(tx.Snapshot, cancellationToken);
+            await _engine.StopAsync(CancellationToken.None);
+            await _network.VerifyRestorationAsync(tx.Snapshot, CancellationToken.None);
 
             tx = tx with { State = ConnectionState.Disconnected };
-            await _journal.WriteAsync(tx, cancellationToken);
-            await _journal.ClearAsync(tx.SessionId, cancellationToken);
+            await _journal.WriteAsync(tx, CancellationToken.None);
+            await _journal.ClearAsync(tx.SessionId, CancellationToken.None);
             _active = null;
         }
         catch
         {
-            if (_active is not null)
-            {
-                _active = _active with { State = ConnectionState.RestorationFailed };
-                try { await _journal.WriteAsync(_active, CancellationToken.None); } catch { }
-            }
+            var failed = tx with { State = ConnectionState.RestorationFailed };
+            _active = failed;
+            try { await _journal.WriteAsync(failed, CancellationToken.None); } catch { }
             throw;
         }
     }

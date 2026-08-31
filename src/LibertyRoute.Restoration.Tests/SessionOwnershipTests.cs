@@ -13,6 +13,137 @@ namespace LibertyRoute.Restoration.Tests;
 
 public sealed class SessionOwnershipTests
 {
+    [Fact]
+    public async Task ConnectCancellationBeforeBaselineCompletionPublishesNothing()
+    {
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var network = new Network
+        {
+            BeforeCapture = async token =>
+            {
+                entered.TrySetResult();
+                await new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task.WaitAsync(token);
+            }
+        };
+        var journal = new Journal();
+        var controller = new ConnectionController(network, journal, new Engine());
+        using var cancellation = new CancellationTokenSource();
+        var operation = controller.BeginSafeConnectAsync(OwnerA, cancellation.Token);
+
+        await entered.Task;
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation);
+
+        Assert.Empty(journal.Writes);
+        Assert.Null(journal.Active);
+    }
+
+    [Fact]
+    public async Task ConnectCancellationImmediatelyBeforePublicationPublishesNothing()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var network = new Network { AfterCapture = cancellation.Cancel };
+        var journal = new Journal();
+        var controller = new ConnectionController(network, journal, new Engine());
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            controller.BeginSafeConnectAsync(OwnerA, cancellation.Token));
+
+        Assert.Empty(journal.Writes);
+        Assert.Null(journal.Active);
+    }
+
+    [Fact]
+    public async Task ConnectPublicationAndBookkeepingSettleAfterCallerCancellation()
+    {
+        var writeEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseWrite = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var journal = new Journal
+        {
+            OnWrite = async _ => { writeEntered.TrySetResult(); await releaseWrite.Task; }
+        };
+        var controller = new ConnectionController(new Network(), journal, new Engine());
+        using var cancellation = new CancellationTokenSource();
+        var operation = controller.BeginSafeConnectAsync(OwnerA, cancellation.Token);
+
+        await writeEntered.Task;
+        cancellation.Cancel();
+        releaseWrite.TrySetResult();
+        var transaction = await operation;
+
+        Assert.Equal(transaction, journal.Active);
+        Assert.Equal(ConnectionState.SnapshotCommitted, controller.State);
+        Assert.All(journal.WriteTokens, token => Assert.Equal(CancellationToken.None, token));
+    }
+
+    [Fact]
+    public async Task RollbackAfterRollingBackPublicationIgnoresCallerCancellationForSafetyWork()
+    {
+        var rollingBackEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseRollingBack = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var journal = new Journal
+        {
+            OnWrite = async transaction =>
+            {
+                if (transaction.State == ConnectionState.RollingBack)
+                {
+                    rollingBackEntered.TrySetResult();
+                    await releaseRollingBack.Task;
+                }
+            }
+        };
+        var network = new Network();
+        var engine = new Engine();
+        var controller = new ConnectionController(network, journal, engine);
+        await controller.BeginSafeConnectAsync(OwnerA, CancellationToken.None);
+        using var cancellation = new CancellationTokenSource();
+        var operation = controller.RollbackAsync("shutdown", cancellation.Token);
+
+        await rollingBackEntered.Task;
+        cancellation.Cancel();
+        releaseRollingBack.TrySetResult();
+        await operation;
+
+        Assert.Null(journal.Active);
+        Assert.Equal(1, journal.Clears);
+        Assert.Equal(CancellationToken.None, engine.StopTokens.Single());
+        Assert.Equal(CancellationToken.None, network.VerifyTokens.Single());
+        Assert.All(journal.WriteTokens, token => Assert.Equal(CancellationToken.None, token));
+    }
+
+    [Fact]
+    public async Task RollbackCancellationBeforeRollingBackPublishesNothing()
+    {
+        var transaction = Transaction(OwnerA);
+        var journal = new Journal { Active = transaction };
+        var controller = new ConnectionController(new Network(), journal, new Engine());
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            controller.RollbackAsync("shutdown", cancellation.Token));
+
+        Assert.Empty(journal.Writes);
+        Assert.Equal(transaction, journal.Active);
+    }
+
+    [Fact]
+    public async Task PostBoundaryFailurePersistsRestorationFailedFromLocalTransaction()
+    {
+        var transaction = Transaction(OwnerA);
+        var journal = new Journal { Active = transaction };
+        var engine = new Engine { StopException = new IOException("stop failure") };
+        var controller = new ConnectionController(new Network(), journal, engine);
+
+        await Assert.ThrowsAsync<IOException>(() => controller.RollbackAsync("shutdown", CancellationToken.None));
+
+        Assert.NotNull(journal.Active);
+        Assert.Equal(transaction.SessionId, journal.Active!.SessionId);
+        Assert.Equal(ConnectionState.RestorationFailed, journal.Active.State);
+        Assert.Equal(0, journal.Clears);
+        Assert.Equal(CancellationToken.None, journal.WriteTokens.Last());
+    }
+
     private const string OwnerA = "S-1-5-21-1001";
     private const string OwnerB = "S-1-5-21-1002";
 
@@ -632,16 +763,22 @@ public sealed class SessionOwnershipTests
         public int Captures { get; private set; }
         public List<NetworkStateSnapshot> VerifiedSnapshots { get; } = new();
         public Exception? CaptureException { get; init; }
-        public Task<NetworkStateSnapshot> CaptureStateAsync(CancellationToken cancellationToken)
+        public Func<CancellationToken, Task>? BeforeCapture { get; init; }
+        public Action? AfterCapture { get; init; }
+        public List<CancellationToken> VerifyTokens { get; } = new();
+        public async Task<NetworkStateSnapshot> CaptureStateAsync(CancellationToken cancellationToken)
         {
             Captures++;
             cancellationToken.ThrowIfCancellationRequested();
+            if (BeforeCapture is not null) await BeforeCapture(cancellationToken);
             if (CaptureException is not null) throw CaptureException;
-            return Task.FromResult(Snapshot());
+            AfterCapture?.Invoke();
+            return Snapshot();
         }
         public Task VerifyRestorationAsync(NetworkStateSnapshot original, CancellationToken cancellationToken)
         {
             VerifiedSnapshots.Add(original);
+            VerifyTokens.Add(cancellationToken);
             return Task.CompletedTask;
         }
     }
@@ -651,6 +788,7 @@ public sealed class SessionOwnershipTests
         private readonly Queue<NetworkTransaction?> _reads = new(reads);
         public int Reads { get; private set; }
         public List<NetworkTransaction> Writes { get; } = new();
+        public List<CancellationToken> WriteTokens { get; } = new();
         public List<Guid> ClearedSessionIds { get; } = new();
         public string JournalPath => "sequenced-test";
 
@@ -677,6 +815,7 @@ public sealed class SessionOwnershipTests
     {
         public NetworkTransaction? Active { get; set; }
         public List<NetworkTransaction> Writes { get; } = new();
+        public List<CancellationToken> WriteTokens { get; } = new();
         public int WriteAttempts { get; private set; }
         public int Clears { get; private set; }
         public Exception? WriteException { get; init; }
@@ -685,6 +824,7 @@ public sealed class SessionOwnershipTests
         public async Task WriteAsync(NetworkTransaction transaction, CancellationToken cancellationToken)
         {
             WriteAttempts++;
+            WriteTokens.Add(cancellationToken);
             if (WriteException is not null) throw WriteException;
             if (OnWrite is not null) await OnWrite(transaction);
             Writes.Add(transaction);
@@ -705,11 +845,15 @@ public sealed class SessionOwnershipTests
     {
         public string Id => "controlled-test";
         public int Stops { get; private set; }
+        public Exception? StopException { get; init; }
+        public List<CancellationToken> StopTokens { get; } = new();
         public Task StartAsync(VpnServerConfig server, CancellationToken cancellationToken)
             => throw new InvalidOperationException("Live engine start is forbidden.");
         public Task StopAsync(CancellationToken cancellationToken)
         {
             Stops++;
+            StopTokens.Add(cancellationToken);
+            if (StopException is not null) throw StopException;
             return Task.CompletedTask;
         }
         public Task<bool> IsHealthyAsync(CancellationToken cancellationToken) => Task.FromResult(false);

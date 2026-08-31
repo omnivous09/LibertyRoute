@@ -541,6 +541,26 @@ public sealed class ControlPipeSecurityTests
     }
 
     [Fact]
+    public async Task ClosedCommandAdmissionPreventsReplayReservationAndDispatch()
+    {
+        var replayGuard = new ControlRequestReplayGuard(new MutableTimeProvider(Now));
+        var dispatcher = new FakeDispatcher();
+        var handler = Handler(dispatcher, replayGuard);
+        var request = Request();
+        var caller = Caller("S-1-5-21-1");
+        await using var closedStream = await RequestStreamAsync(request);
+
+        await handler.HandleAuthenticatedAsync(
+            closedStream, caller, new FixedCommandAdmission(false), CancellationToken.None);
+
+        Assert.Equal(0, dispatcher.Calls);
+        await using var openStream = await RequestStreamAsync(request);
+        await handler.HandleAuthenticatedAsync(
+            openStream, caller, new FixedCommandAdmission(true), CancellationToken.None);
+        Assert.Equal(1, dispatcher.Calls);
+    }
+
+    [Fact]
     public async Task InitialAndSubsequentInstancesPreserveSecureBoundedTopology()
     {
         using var current = WindowsIdentity.GetCurrent(TokenAccessLevels.Query);
@@ -1240,6 +1260,11 @@ public sealed class ControlPipeSecurityTests
                 throw Exception;
             return Task.FromResult(new ControlDispatchResult(ControlOutcome.Succeeded, ControlErrorCode.None, Result));
         }
+    }
+
+    private sealed class FixedCommandAdmission(bool result) : IControlCommandAdmission
+    {
+        public bool TryAdmit() => result;
     }
 
     private sealed class DeadlineStream(byte[] input, int blockWriteAt = int.MaxValue) : Stream

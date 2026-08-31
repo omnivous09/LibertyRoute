@@ -1,10 +1,276 @@
+using LibertyRoute.Core;
+using LibertyRoute.Engine;
+using LibertyRoute.Networking;
+using LibertyRoute.Recovery;
 using LibertyRoute.Service;
+using LibertyRoute.Restoration.Windows;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace LibertyRoute.Restoration.Tests;
 
 public sealed class ControlRuntimeHardeningTests
 {
+    [Fact]
+    public async Task WorkerRollbackStartsOnlyAfterRegisteredCommandDrains()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 1);
+        var commandEntered = NewSignal();
+        var releaseCommand = NewSignal();
+        var server = harness.Server(async (_, _) =>
+        {
+            commandEntered.TrySetResult();
+            await releaseCommand.Task;
+        });
+        var engine = new WorkerEngine();
+        var worker = Worker(server, engine);
+        await worker.StartAsync(CancellationToken.None);
+        await commandEntered.Task;
+
+        var stop = worker.StopAsync(CancellationToken.None);
+        await server.ShutdownStarted;
+        Assert.False(engine.StopStarted.Task.IsCompleted);
+        Assert.False(stop.IsCompleted);
+
+        releaseCommand.TrySetResult();
+        await stop;
+        Assert.True(engine.StopStarted.Task.IsCompletedSuccessfully);
+        Assert.Equal(ControlPipeServerState.Stopped, server.State);
+    }
+
+    [Fact]
+    public async Task WorkerDrainBudgetExpiryNeverFallsThroughToRollback()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 1);
+        var commandEntered = NewSignal();
+        var releaseCommand = NewSignal();
+        var server = harness.Server(async (_, _) =>
+        {
+            commandEntered.TrySetResult();
+            await releaseCommand.Task;
+        });
+        var engine = new WorkerEngine();
+        var worker = Worker(server, engine);
+        await worker.StartAsync(CancellationToken.None);
+        await commandEntered.Task;
+        using var budget = new CancellationTokenSource();
+
+        var stop = worker.StopAsync(budget.Token);
+        await server.ShutdownStarted;
+        budget.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => stop);
+        Assert.False(engine.StopStarted.Task.IsCompleted);
+
+        releaseCommand.TrySetResult();
+        await server.DrainCompletion;
+        Assert.False(engine.StopStarted.Task.IsCompleted);
+    }
+
+    [Fact]
+    public async Task ShutdownWithNoClientsStopsAndDrains()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 0);
+        var server = harness.Server((_, _) => Task.CompletedTask);
+        using var cancellation = new CancellationTokenSource();
+        var run = server.RunAsync(cancellation.Token);
+
+        await harness.WaitForCreatedAsync(1);
+        cancellation.Cancel();
+        await run;
+
+        Assert.Equal(ControlPipeServerState.Stopped, server.State);
+        Assert.True(server.DrainCompletion.IsCompletedSuccessfully);
+        Assert.Equal(0, server.ActiveTaskCount);
+        Assert.Equal(1, harness.Connection(1).DisposeCount);
+    }
+
+    [Fact]
+    public async Task ShutdownWinningBeforeRegistrationRejectsAcceptedConnection()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 1);
+        var registrationReached = NewSignal();
+        var resumeRegistration = NewSignal();
+        var handled = 0;
+        var server = harness.ServerWithAdmission((_, _, _) => { handled++; return Task.CompletedTask; }, async () =>
+        {
+            registrationReached.TrySetResult();
+            await resumeRegistration.Task;
+        });
+        using var cancellation = new CancellationTokenSource();
+        var run = server.RunAsync(cancellation.Token);
+
+        await registrationReached.Task;
+        cancellation.Cancel();
+        resumeRegistration.TrySetResult();
+        await run;
+
+        Assert.Equal(0, handled);
+        Assert.Equal(0, server.ActiveTaskCount);
+        Assert.Equal(1, harness.Connection(1).DisposeCount);
+        Assert.Equal(ControlPipeServerState.Stopped, server.State);
+    }
+
+    [Fact]
+    public async Task RegisteredClientCannotAdmitCommandAfterShutdownLinearizes()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 1);
+        var handlerEntered = NewSignal();
+        var attemptAdmission = NewSignal();
+        var admitted = true;
+        var server = harness.ServerWithAdmission(async (_, admission, _) =>
+        {
+            handlerEntered.TrySetResult();
+            await attemptAdmission.Task;
+            admitted = admission.TryAdmit();
+        });
+        using var cancellation = new CancellationTokenSource();
+        var run = server.RunAsync(cancellation.Token);
+
+        await handlerEntered.Task;
+        cancellation.Cancel();
+        attemptAdmission.TrySetResult();
+        await run;
+
+        Assert.False(admitted);
+        Assert.Equal(1, harness.Connection(1).DisposeCount);
+        Assert.Equal(0, server.ActiveTaskCount);
+    }
+
+    [Fact]
+    public async Task AdmittedReadOnlyCommandObservesTransportShutdownAndDrains()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 1);
+        var admitted = NewSignal();
+        var cancellationObserved = NewSignal();
+        var server = harness.ServerWithAdmission(async (_, admission, token) =>
+        {
+            Assert.True(admission.TryAdmit());
+            admitted.TrySetResult();
+            try { await Task.Delay(Timeout.InfiniteTimeSpan, token); }
+            catch (OperationCanceledException) when (token.IsCancellationRequested)
+            {
+                cancellationObserved.TrySetResult();
+                throw;
+            }
+        });
+        using var cancellation = new CancellationTokenSource();
+        var run = server.RunAsync(cancellation.Token);
+        await admitted.Task;
+
+        cancellation.Cancel();
+        await cancellationObserved.Task;
+        await run;
+
+        Assert.Equal(0, server.ActiveTaskCount);
+        Assert.Equal(ControlPipeServerState.Stopped, server.State);
+    }
+
+    [Fact]
+    public async Task ShutdownDrainsRegisteredHandlerBeforeRunCompletes()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 1);
+        var entered = NewSignal();
+        var release = NewSignal();
+        var server = harness.Server(async (_, _) => { entered.TrySetResult(); await release.Task; });
+        using var cancellation = new CancellationTokenSource();
+        var run = server.RunAsync(cancellation.Token);
+
+        await entered.Task;
+        cancellation.Cancel();
+        Assert.False(run.IsCompleted);
+        release.TrySetResult();
+        await run;
+
+        Assert.Equal(0, server.ActiveTaskCount);
+        Assert.Equal(ControlPipeServerState.Stopped, server.State);
+    }
+
+    [Fact]
+    public async Task ListenerDisposalFailureDuringCancellationFaultsAfterCleanup()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 0);
+        var server = harness.Server((_, _) => Task.CompletedTask);
+        using var cancellation = new CancellationTokenSource();
+        var run = server.RunAsync(cancellation.Token);
+        await harness.WaitForCreatedAsync(1);
+        harness.Connection(1).DisposeException = new IOException("dispose failure");
+
+        cancellation.Cancel();
+        var exception = await Assert.ThrowsAsync<AggregateException>(() => run);
+
+        Assert.Contains(exception.InnerExceptions, item => item is OperationCanceledException);
+        Assert.Contains(exception.InnerExceptions, item => item is IOException);
+        Assert.Equal(1, harness.Connection(1).DisposeCount);
+        Assert.Equal(0, server.ActiveTaskCount);
+        Assert.Equal(ControlPipeServerState.Faulted, server.State);
+    }
+
+    [Fact]
+    public async Task RejectedAcceptedClientDisposalCancellationFaultsServer()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 1);
+        var registrationReached = NewSignal();
+        var resumeRegistration = NewSignal();
+        var handled = 0;
+        var server = harness.ServerWithAdmission((_, _, _) => { handled++; return Task.CompletedTask; }, async () =>
+        {
+            registrationReached.TrySetResult();
+            await resumeRegistration.Task;
+        });
+        using var cancellation = new CancellationTokenSource();
+        var run = server.RunAsync(cancellation.Token);
+        await registrationReached.Task;
+        harness.Connection(1).DisposeException = new OperationCanceledException("disposal cancellation");
+
+        cancellation.Cancel();
+        resumeRegistration.TrySetResult();
+        var exception = await Assert.ThrowsAsync<OperationCanceledException>(() => run);
+
+        Assert.Equal("disposal cancellation", exception.Message);
+        Assert.Equal(0, handled);
+        Assert.Equal(1, harness.Connection(1).DisposeCount);
+        Assert.Equal(1, harness.AdmissionReleaseCount);
+        Assert.Equal(ControlPipeServerState.Faulted, server.State);
+        Assert.Equal(1, harness.CreatedCount);
+    }
+
+    [Fact]
+    public async Task RegisteredClientDisposalCancellationIsLoggedAndCleanupCompletes()
+    {
+        var harness = new Harness(acceptImmediatelyThrough: 2);
+        var logger = new RecordingLogger();
+        var firstEntered = NewSignal();
+        var secondCompleted = NewSignal();
+        var server = harness.ServerWithAdmission(async (connection, _, token) =>
+        {
+            if (connection.Id == 1)
+            {
+                connection.DisposeException = new OperationCanceledException("registered disposal cancellation");
+                firstEntered.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            }
+            else
+            {
+                secondCompleted.TrySetResult();
+            }
+        }, logger: logger);
+        using var cancellation = new CancellationTokenSource();
+        var run = server.RunAsync(cancellation.Token);
+
+        await firstEntered.Task;
+        await secondCompleted.Task;
+        await harness.WaitForCreatedAsync(3);
+        cancellation.Cancel();
+        await run;
+
+        Assert.Contains(logger.Exceptions, exception =>
+            exception is OperationCanceledException { Message: "registered disposal cancellation" });
+        Assert.Equal(1, harness.Connection(1).DisposeCount);
+        Assert.Equal(harness.CreatedCount, harness.AdmissionReleaseCount);
+        Assert.Equal(0, server.ActiveTaskCount);
+        Assert.Equal(ControlPipeServerState.Stopped, server.State);
+    }
+
     [Fact]
     public async Task SlowClientDoesNotMonopolizeListener()
     {
@@ -149,6 +415,64 @@ public sealed class ControlRuntimeHardeningTests
     private static TaskCompletionSource NewSignal()
         => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    private static LibertyRouteWorker Worker(BoundedControlPipeServer server, WorkerEngine engine)
+    {
+        var transaction = new NetworkTransaction(
+            Guid.NewGuid(), ConnectionState.SnapshotCommitted, DateTimeOffset.UtcNow,
+            new NetworkStateSnapshot(DateTimeOffset.UtcNow, "machine", Array.Empty<AdapterState>()),
+            Array.Empty<OwnedNetworkChange>(), engine.Id, null, "S-1-5-21-1001");
+        var controller = new ConnectionController(new WorkerNetwork(), new WorkerJournal(transaction), engine);
+        return new LibertyRouteWorker(
+            controller, new NoRecoveryReconciler(), NullLogger<LibertyRouteWorker>.Instance, () => server);
+    }
+
+    private sealed class NoRecoveryReconciler : IRecoveryStartupReconciler
+    {
+        public Task<RecoveryStartupReconciliationResult> ReconcileAsync(CancellationToken cancellationToken)
+            => Task.FromResult(new RecoveryStartupReconciliationResult(
+                RecoveryStartupReconciliationStatus.NoJournal, null, null, null, false, "test"));
+    }
+
+    private sealed class WorkerNetwork : INetworkStateManager
+    {
+        public Task<NetworkStateSnapshot> CaptureStateAsync(CancellationToken cancellationToken)
+            => throw new InvalidOperationException("Capture is not expected.");
+        public Task VerifyRestorationAsync(NetworkStateSnapshot original, CancellationToken cancellationToken)
+            => Task.CompletedTask;
+    }
+
+    private sealed class WorkerJournal(NetworkTransaction active) : ITransactionJournal
+    {
+        private NetworkTransaction? _active = active;
+        public string JournalPath => "worker-test";
+        public Task<NetworkTransaction?> ReadActiveAsync(CancellationToken cancellationToken)
+            => Task.FromResult(_active);
+        public Task WriteAsync(NetworkTransaction transaction, CancellationToken cancellationToken)
+        {
+            _active = transaction;
+            return Task.CompletedTask;
+        }
+        public Task ClearAsync(Guid expectedSessionId, CancellationToken cancellationToken)
+        {
+            _active = null;
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class WorkerEngine : IConnectionEngine
+    {
+        public string Id => "worker-test";
+        public TaskCompletionSource StopStarted { get; } = NewSignal();
+        public Task StartAsync(VpnServerConfig server, CancellationToken cancellationToken)
+            => throw new InvalidOperationException("Live engine start is forbidden.");
+        public Task StopAsync(CancellationToken cancellationToken)
+        {
+            StopStarted.TrySetResult();
+            return Task.CompletedTask;
+        }
+        public Task<bool> IsHealthyAsync(CancellationToken cancellationToken) => Task.FromResult(false);
+    }
+
     private sealed class Harness
     {
         private readonly object _sync = new();
@@ -157,6 +481,7 @@ public sealed class ControlRuntimeHardeningTests
         private readonly Dictionary<int, TaskCompletionSource> _releases = new();
         private readonly Dictionary<int, int> _handleCounts = new();
         private readonly Dictionary<int, TaskCompletionSource> _acceptedSignals = new();
+        private readonly Dictionary<int, TaskCompletionSource> _createdSignals = new();
         private readonly Dictionary<int, TaskCompletionSource> _handledSignals = new();
         private readonly Dictionary<int, TaskCompletionSource> _trackedSignals = new();
         private readonly Dictionary<int, TaskCompletionSource> _blockedSignals = new();
@@ -167,6 +492,7 @@ public sealed class ControlRuntimeHardeningTests
         private int _active;
         private int _trackedAdmissions;
         private int _blocked;
+        private int _admissionReleaseCount;
 
         internal Harness(int acceptImmediatelyThrough)
         {
@@ -177,6 +503,7 @@ public sealed class ControlRuntimeHardeningTests
         internal int CreatedCount { get { lock (_sync) return _created; } }
         internal int AcceptedCount { get { lock (_sync) return _accepted; } }
         internal int HandledCount { get { lock (_sync) return _handled; } }
+        internal int AdmissionReleaseCount { get { lock (_sync) return _admissionReleaseCount; } }
         internal int MaximumObservedActiveCount { get; private set; }
         internal IReadOnlyList<FakeConnection> AcceptedConnections
         {
@@ -185,11 +512,19 @@ public sealed class ControlRuntimeHardeningTests
 
         internal BoundedControlPipeServer Server(
             Func<FakeConnection, CancellationToken, Task> handler)
+            => ServerWithAdmission((connection, _, token) => handler(connection, token));
+
+        internal BoundedControlPipeServer ServerWithAdmission(
+            Func<FakeConnection, IControlCommandAdmission, CancellationToken, Task> handler,
+            Func<Task>? beforeRegistration = null,
+            ILogger? logger = null)
             => new(
                 Create,
-                (connection, token) => handler((FakeConnection)connection, token),
-                NullLogger.Instance,
-                ActiveCountChanged);
+                (connection, admission, token) => handler((FakeConnection)connection, admission, token),
+                logger ?? NullLogger.Instance,
+                ActiveCountChanged,
+                beforeRegistration,
+                AdmissionReleased);
 
         internal FakeConnection Connection(int id)
         {
@@ -246,6 +581,12 @@ public sealed class ControlRuntimeHardeningTests
                 return _accepted >= count ? Task.CompletedTask : GetSignal(_acceptedSignals, count).Task;
         }
 
+        internal Task WaitForCreatedAsync(int count)
+        {
+            lock (_sync)
+                return _created >= count ? Task.CompletedTask : GetSignal(_createdSignals, count).Task;
+        }
+
         internal Task WaitForHandledAsync(int count)
         {
             lock (_sync)
@@ -276,6 +617,7 @@ public sealed class ControlRuntimeHardeningTests
                 var id = ++_created;
                 var connection = new FakeConnection(id, firstInstance, this);
                 _connections.Add(id, connection);
+                Signal(_createdSignals, id);
                 return connection;
             }
         }
@@ -308,6 +650,11 @@ public sealed class ControlRuntimeHardeningTests
             }
         }
 
+        private void AdmissionReleased()
+        {
+            lock (_sync) _admissionReleaseCount++;
+        }
+
         private static TaskCompletionSource GetSignal(
             Dictionary<int, TaskCompletionSource> signals,
             int count)
@@ -329,6 +676,7 @@ public sealed class ControlRuntimeHardeningTests
             Harness owner) : IControlPipeConnection
         {
             private int _disposeCount;
+            internal Exception? DisposeException { get; set; }
             internal int Id { get; } = id;
             internal bool FirstInstance { get; } = firstInstance;
             internal bool Accepted { get; set; }
@@ -347,8 +695,24 @@ public sealed class ControlRuntimeHardeningTests
             public ValueTask DisposeAsync()
             {
                 Interlocked.Increment(ref _disposeCount);
+                if (DisposeException is not null) throw DisposeException;
                 return ValueTask.CompletedTask;
             }
+        }
+    }
+
+    private sealed class RecordingLogger : ILogger
+    {
+        private readonly object _sync = new();
+        private readonly List<Exception> _exceptions = new();
+        internal IReadOnlyList<Exception> Exceptions { get { lock (_sync) return _exceptions.ToArray(); } }
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            if (exception is not null)
+                lock (_sync) _exceptions.Add(exception);
         }
     }
 }
