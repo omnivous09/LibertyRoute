@@ -56,6 +56,19 @@ public static class LengthPrefixedJsonProtocol
             ValidateResponse,
             cancellationToken);
 
+    internal static Task WriteResponseForTestsAsync(
+        Stream stream,
+        ControlResponseEnvelope response,
+        Action serializationCompleted,
+        CancellationToken cancellationToken)
+        => WriteAsync(
+            stream,
+            response,
+            ControlProtocolConstants.MaximumResponseSize,
+            ValidateResponse,
+            cancellationToken,
+            serializationCompleted);
+
     private static async Task<T> ReadAsync<T>(
         Stream stream,
         int maximumSize,
@@ -113,29 +126,35 @@ public static class LengthPrefixedJsonProtocol
         T envelope,
         int maximumSize,
         Action<T> validate,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action? serializationCompleted = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
         ArgumentNullException.ThrowIfNull(envelope);
         validate(envelope);
 
-        byte[] payload;
+        var payload = new CappedSerializationStream(maximumSize);
         try
         {
-            payload = JsonSerializer.SerializeToUtf8Bytes(envelope, JsonOptions);
+            var boundedOptions = new JsonSerializerOptions(JsonOptions);
+            boundedOptions.Converters.Insert(0, new MaximumStringSizeConverter(maximumSize));
+            await JsonSerializer.SerializeAsync(payload, envelope, boundedOptions, cancellationToken);
+            serializationCompleted?.Invoke();
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        catch (SerializationLimitExceededException)
+        {
+            throw new ControlProtocolException(ControlProtocolError.FrameTooLarge);
         }
         catch (JsonException)
         {
             throw new ControlProtocolException(ControlProtocolError.InvalidContract);
         }
 
-        if (payload.Length > maximumSize)
-            throw new ControlProtocolException(ControlProtocolError.FrameTooLarge);
-
         var prefix = new byte[ControlProtocolConstants.LengthPrefixSize];
-        BinaryPrimitives.WriteInt32BigEndian(prefix, payload.Length);
+        BinaryPrimitives.WriteInt32BigEndian(prefix, payload.WrittenCount);
         await stream.WriteAsync(prefix, cancellationToken);
-        await stream.WriteAsync(payload, cancellationToken);
+        await stream.WriteAsync(payload.WrittenMemory, cancellationToken);
     }
 
     private static async Task ReadExactlyAsync(
@@ -257,5 +276,61 @@ public static class LengthPrefixedJsonProtocol
 
         private static string ToWireValue(TEnum value)
             => value.ToString().ToUpperInvariant();
+    }
+
+    private sealed class CappedSerializationStream(int maximumSize) : Stream
+    {
+        private readonly byte[] _buffer = new byte[maximumSize];
+        private int _written;
+
+        internal int WrittenCount => _written;
+        internal ReadOnlyMemory<byte> WrittenMemory => _buffer.AsMemory(0, _written);
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => _written;
+        public override long Position { get => _written; set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count)
+            => Write(buffer.AsSpan(offset, count));
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            if (buffer.Length > _buffer.Length - _written)
+                throw new SerializationLimitExceededException();
+            buffer.CopyTo(_buffer.AsSpan(_written));
+            _written += buffer.Length;
+        }
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Write(buffer.Span);
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class SerializationLimitExceededException : Exception;
+
+    private sealed class MaximumStringSizeConverter(int maximumSize) : JsonConverter<string>
+    {
+        public override string? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+            => reader.GetString();
+
+        public override void Write(Utf8JsonWriter writer, string value, JsonSerializerOptions options)
+        {
+            try
+            {
+                if (StrictUtf8.GetByteCount(value) > maximumSize)
+                    throw new SerializationLimitExceededException();
+            }
+            catch (EncoderFallbackException)
+            {
+                throw new JsonException();
+            }
+            writer.WriteStringValue(value);
+        }
     }
 }

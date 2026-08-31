@@ -365,6 +365,7 @@ public sealed class ServiceCompositionTests
         var handler = new SecureControlConnectionHandler(
             ControlServiceInstance.CreateTransient(), new ControlCommandAuthorization(),
             new ControlRequestReplayGuard(TimeProvider.System), new InertDispatcher(),
+            TimeProvider.System,
             NullLogger<SecureControlConnectionHandler>.Instance);
         var worker = new LibertyRouteWorker(controller, pipeFactory, handler, reconciler,
             NullLogger<LibertyRouteWorker>.Instance);
@@ -432,6 +433,7 @@ public sealed class ServiceCompositionTests
         var handler = new SecureControlConnectionHandler(
             ControlServiceInstance.CreateTransient(), new ControlCommandAuthorization(),
             new ControlRequestReplayGuard(TimeProvider.System), new InertDispatcher(),
+            TimeProvider.System,
             NullLogger<SecureControlConnectionHandler>.Instance);
         return new LibertyRouteWorker(controller, pipeFactory, handler, reconciler,
             NullLogger<LibertyRouteWorker>.Instance);

@@ -934,6 +934,195 @@ public sealed class ControlPipeSecurityTests
             rule.PipeAccessRights == (rights | PipeAccessRights.Synchronize));
     }
 
+    [Fact]
+    public async Task GreetingDeadlineUsesFiveSecondVirtualTimeAndDispatchesNothing()
+    {
+        var time = new ManualTimerTimeProvider(Now);
+        var dispatcher = new FakeDispatcher();
+        await using var stream = new DeadlineStream(Array.Empty<byte>(), blockWriteAt: 1);
+        var operation = Handler(dispatcher, transportTimeProvider: time)
+            .HandleAuthenticatedForTestsAsync(stream, Caller("S-1-5-21-1"), CancellationToken.None);
+
+        await stream.Blocked;
+        time.Advance(TimeSpan.FromSeconds(5));
+        await operation;
+
+        Assert.Equal(0, dispatcher.Calls);
+        Assert.Equal(0, time.ActiveTimers);
+    }
+
+    [Fact]
+    public async Task RequestDeadlineIsTotalAcrossPartialFrameAndDispatchesNothing()
+    {
+        var time = new ManualTimerTimeProvider(Now);
+        var dispatcher = new FakeDispatcher();
+        await using var stream = new DeadlineStream(new byte[] { 0, 0 });
+        var operation = Handler(dispatcher, transportTimeProvider: time)
+            .HandleAuthenticatedForTestsAsync(stream, Caller("S-1-5-21-1"), CancellationToken.None);
+
+        await stream.Blocked;
+        time.Advance(TimeSpan.FromSeconds(9));
+        Assert.False(operation.IsCompleted);
+        time.Advance(TimeSpan.FromSeconds(1));
+        await operation;
+
+        Assert.Equal(0, dispatcher.Calls);
+        Assert.Equal(0, time.ActiveTimers);
+    }
+
+    [Fact]
+    public async Task RequestDeadlineWithZeroPrefixBytesDispatchesNothing()
+    {
+        var time = new ManualTimerTimeProvider(Now);
+        var dispatcher = new FakeDispatcher();
+        await using var stream = new DeadlineStream(Array.Empty<byte>());
+        var operation = Handler(dispatcher, transportTimeProvider: time)
+            .HandleAuthenticatedForTestsAsync(stream, Caller("S-1-5-21-1"), CancellationToken.None);
+
+        await stream.Blocked;
+        time.Advance(TimeSpan.FromSeconds(10));
+        await operation;
+
+        Assert.Equal(0, dispatcher.Calls);
+        Assert.Equal(0, time.ActiveTimers);
+    }
+
+    [Fact]
+    public async Task RequestDeadlineWithCompletePrefixAndPartialPayloadDispatchesNothing()
+    {
+        var time = new ManualTimerTimeProvider(Now);
+        var dispatcher = new FakeDispatcher();
+        var partialFrame = new byte[] { 0, 0, 0, 10, (byte)'{', (byte)'"' };
+        await using var stream = new DeadlineStream(partialFrame);
+        var operation = Handler(dispatcher, transportTimeProvider: time)
+            .HandleAuthenticatedForTestsAsync(stream, Caller("S-1-5-21-1"), CancellationToken.None);
+
+        await stream.Blocked;
+        time.Advance(TimeSpan.FromSeconds(10));
+        await operation;
+
+        Assert.Equal(0, dispatcher.Calls);
+        Assert.Equal(0, time.ActiveTimers);
+    }
+
+    [Fact]
+    public async Task ProgressiveRequestReadsDoNotResetOriginalDeadline()
+    {
+        var time = new ManualTimerTimeProvider(Now);
+        var dispatcher = new FakeDispatcher();
+        await using var stream = new ProgressiveReadStream();
+        var operation = Handler(dispatcher, transportTimeProvider: time)
+            .HandleAuthenticatedForTestsAsync(stream, Caller("S-1-5-21-1"), CancellationToken.None);
+
+        await stream.WaitForReadAttemptAsync(1);
+        stream.Supply(new byte[] { 0 });
+        await stream.WaitForReadAttemptAsync(2);
+        time.Advance(TimeSpan.FromSeconds(6));
+        stream.Supply(new byte[] { 0 });
+        await stream.WaitForReadAttemptAsync(3);
+        time.Advance(TimeSpan.FromSeconds(4));
+        await operation;
+
+        Assert.Equal(0, dispatcher.Calls);
+        Assert.Equal(0, time.ActiveTimers);
+    }
+
+    [Fact]
+    public async Task ResponseDeadlineUsesTenSecondVirtualTimeWithoutRedispatch()
+    {
+        var time = new ManualTimerTimeProvider(Now);
+        var dispatcher = new FakeDispatcher();
+        await using var input = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteRequestAsync(input, Request());
+        await using var stream = new DeadlineStream(input.ToArray(), blockWriteAt: 3);
+        var operation = Handler(dispatcher, transportTimeProvider: time)
+            .HandleAuthenticatedForTestsAsync(stream, Caller("S-1-5-21-1"), CancellationToken.None);
+
+        await stream.Blocked;
+        Assert.Equal(1, dispatcher.Calls);
+        time.Advance(TimeSpan.FromSeconds(10));
+        await operation;
+
+        Assert.Equal(1, dispatcher.Calls);
+        Assert.Equal(0, time.ActiveTimers);
+    }
+
+    [Fact]
+    public async Task ResponsePrefixCompletesButPayloadStallUsesOriginalDeadlineWithoutRedispatch()
+    {
+        var time = new ManualTimerTimeProvider(Now);
+        var dispatcher = new FakeDispatcher();
+        await using var input = new MemoryStream();
+        await LengthPrefixedJsonProtocol.WriteRequestAsync(input, Request());
+        await using var stream = new DeadlineStream(input.ToArray(), blockWriteAt: 4);
+        var operation = Handler(dispatcher, transportTimeProvider: time)
+            .HandleAuthenticatedForTestsAsync(stream, Caller("S-1-5-21-1"), CancellationToken.None);
+
+        await stream.Blocked;
+        Assert.Equal(4, stream.WriteAttempts);
+        Assert.Equal(1, dispatcher.Calls);
+        time.Advance(TimeSpan.FromSeconds(10));
+        await operation;
+
+        Assert.Equal(4, stream.WriteAttempts);
+        Assert.Equal(1, dispatcher.Calls);
+        Assert.Equal(0, time.ActiveTimers);
+    }
+
+    [Fact]
+    public async Task CallerCancellationDuringBlockedRequestRemainsOrdinaryCancellation()
+    {
+        var time = new ManualTimerTimeProvider(Now);
+        var dispatcher = new FakeDispatcher();
+        using var callerCancellation = new CancellationTokenSource();
+        await using var stream = new DeadlineStream(Array.Empty<byte>());
+        var operation = Handler(dispatcher, transportTimeProvider: time)
+            .HandleAuthenticatedForTestsAsync(stream, Caller("S-1-5-21-1"), callerCancellation.Token);
+
+        await stream.Blocked;
+        callerCancellation.Cancel();
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation);
+
+        Assert.IsNotType<ControlTransportDeadlineException>(exception);
+        Assert.Equal(callerCancellation.Token, exception.CancellationToken);
+        Assert.Equal(0, dispatcher.Calls);
+        Assert.Equal(0, time.ActiveTimers);
+    }
+
+    [Fact]
+    public async Task CallerCancellationWinsWhenCallerAndDeadlineAreBothCanceled()
+    {
+        var time = new ManualTimerTimeProvider(Now);
+        var policy = new ControlTransportDeadlinePolicy(time);
+        using var callerCancellation = new CancellationTokenSource();
+
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            policy.ExecuteRequestAsync<object?>(token =>
+            {
+                callerCancellation.Cancel();
+                time.Advance(TimeSpan.FromSeconds(10));
+                throw new OperationCanceledException(token);
+            }, callerCancellation.Token));
+
+        Assert.IsNotType<ControlTransportDeadlineException>(exception);
+        Assert.Equal(callerCancellation.Token, exception.CancellationToken);
+        Assert.Equal(0, time.ActiveTimers);
+    }
+
+    [Fact]
+    public async Task TransportDeadlineTokenNeverReachesDispatcher()
+    {
+        using var callerCancellation = new CancellationTokenSource();
+        var dispatcher = new FakeDispatcher();
+        await using var stream = await RequestStreamAsync(Request());
+
+        await Handler(dispatcher).HandleAuthenticatedForTestsAsync(
+            stream, Caller("S-1-5-21-1"), callerCancellation.Token);
+
+        Assert.Equal(callerCancellation.Token, dispatcher.LastCancellationToken);
+        Assert.Equal(1, dispatcher.Calls);
+    }
+
     private static bool HasRequiredDuplexRights(PipeAccessRights rights)
         => (rights & PipeAccessRights.ReadWrite) == PipeAccessRights.ReadWrite;
 
@@ -963,12 +1152,14 @@ public sealed class ControlPipeSecurityTests
     private static SecureControlConnectionHandler Handler(
         IControlCommandDispatcher dispatcher,
         ControlRequestReplayGuard? replayGuard = null,
-        ControlCommandAuthorization? authorization = null)
+        ControlCommandAuthorization? authorization = null,
+        TimeProvider? transportTimeProvider = null)
         => new(
             new ControlServiceInstance(InstanceId),
             authorization ?? new ControlCommandAuthorization(),
             replayGuard ?? new ControlRequestReplayGuard(new MutableTimeProvider(Now)),
             dispatcher,
+            transportTimeProvider ?? TimeProvider.System,
             NullLogger<SecureControlConnectionHandler>.Instance);
 
     private static async Task<ControlResponseEnvelope?> InvokeAsync(
@@ -1034,6 +1225,7 @@ public sealed class ControlPipeSecurityTests
     private sealed class FakeDispatcher : IControlCommandDispatcher
     {
         public int Calls { get; private set; }
+        public CancellationToken LastCancellationToken { get; private set; }
         public Exception? Exception { get; set; }
         public ControlResponseResult Result { get; set; } = new ControlStatusResult(ControlConnectionState.Disconnected);
 
@@ -1043,9 +1235,151 @@ public sealed class ControlPipeSecurityTests
             CancellationToken cancellationToken)
         {
             Calls++;
+            LastCancellationToken = cancellationToken;
             if (Exception is not null)
                 throw Exception;
             return Task.FromResult(new ControlDispatchResult(ControlOutcome.Succeeded, ControlErrorCode.None, Result));
+        }
+    }
+
+    private sealed class DeadlineStream(byte[] input, int blockWriteAt = int.MaxValue) : Stream
+    {
+        private readonly MemoryStream _input = new(input, writable: false);
+        private int _writes;
+        private readonly TaskCompletionSource _blocked = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource _never = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task Blocked => _blocked.Task;
+        public int WriteAttempts => _writes;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var read = await _input.ReadAsync(buffer, cancellationToken);
+            if (read != 0) return read;
+            _blocked.TrySetResult();
+            await _never.Task.WaitAsync(cancellationToken);
+            return 0;
+        }
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref _writes) < blockWriteAt) return;
+            _blocked.TrySetResult();
+            await _never.Task.WaitAsync(cancellationToken);
+        }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+    }
+
+    private sealed class ProgressiveReadStream : Stream
+    {
+        private readonly object _sync = new();
+        private readonly Queue<byte[]> _chunks = new();
+        private readonly SemaphoreSlim _available = new(0);
+        private readonly List<TaskCompletionSource> _readAttempts = new();
+        private int _attempts;
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public void Supply(byte[] bytes)
+        {
+            lock (_sync) _chunks.Enqueue(bytes);
+            _available.Release();
+        }
+        public Task WaitForReadAttemptAsync(int attempt)
+        {
+            lock (_sync)
+            {
+                while (_readAttempts.Count < attempt)
+                    _readAttempts.Add(new(TaskCreationOptions.RunContinuationsAsynchronously));
+                if (_attempts >= attempt) return Task.CompletedTask;
+                return _readAttempts[attempt - 1].Task;
+            }
+        }
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            TaskCompletionSource? signal;
+            lock (_sync)
+            {
+                _attempts++;
+                signal = _attempts <= _readAttempts.Count ? _readAttempts[_attempts - 1] : null;
+            }
+            signal?.TrySetResult();
+            await _available.WaitAsync(cancellationToken);
+            byte[] chunk;
+            lock (_sync) chunk = _chunks.Dequeue();
+            chunk.CopyTo(buffer);
+            return chunk.Length;
+        }
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+            => ValueTask.CompletedTask;
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        protected override void Dispose(bool disposing) { if (disposing) _available.Dispose(); base.Dispose(disposing); }
+    }
+
+    private sealed class ManualTimerTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        private readonly object _sync = new();
+        private readonly List<ManualTimer> _timers = new();
+        private DateTimeOffset _now = now;
+        public int ActiveTimers { get { lock (_sync) return _timers.Count(timer => timer.Active); } }
+        public override DateTimeOffset GetUtcNow() { lock (_sync) return _now; }
+        public override long GetTimestamp() => GetUtcNow().UtcTicks;
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = new ManualTimer(this, callback, state, dueTime, period);
+            lock (_sync) _timers.Add(timer);
+            return timer;
+        }
+        public void Advance(TimeSpan amount)
+        {
+            ManualTimer[] due;
+            lock (_sync)
+            {
+                _now += amount;
+                due = _timers.Where(timer => timer.IsDue(_now)).ToArray();
+            }
+            foreach (var timer in due) timer.Fire();
+        }
+        private sealed class ManualTimer : ITimer
+        {
+            private readonly ManualTimerTimeProvider _owner;
+            private readonly TimerCallback _callback;
+            private readonly object? _state;
+            private DateTimeOffset _due;
+            private TimeSpan _period;
+            internal bool Active { get; private set; }
+            internal ManualTimer(ManualTimerTimeProvider owner, TimerCallback callback, object? state, TimeSpan due, TimeSpan period)
+            { _owner = owner; _callback = callback; _state = state; Change(due, period); }
+            public bool Change(TimeSpan dueTime, TimeSpan period)
+            {
+                _period = period;
+                Active = dueTime != Timeout.InfiniteTimeSpan;
+                _due = _owner.GetUtcNow() + (Active ? dueTime : TimeSpan.Zero);
+                return true;
+            }
+            internal bool IsDue(DateTimeOffset now) => Active && now >= _due;
+            internal void Fire()
+            {
+                if (!Active) return;
+                if (_period == Timeout.InfiniteTimeSpan) Active = false;
+                else _due += _period;
+                _callback(_state);
+            }
+            public void Dispose() => Active = false;
+            public ValueTask DisposeAsync() { Dispose(); return ValueTask.CompletedTask; }
         }
     }
 

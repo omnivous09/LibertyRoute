@@ -22,6 +22,7 @@ internal sealed class SecureControlConnectionHandler
     private readonly ControlCommandAuthorization _authorization;
     private readonly ControlRequestReplayGuard _replayGuard;
     private readonly IControlCommandDispatcher _dispatcher;
+    private readonly ControlTransportDeadlinePolicy _deadlines;
     private readonly ILogger<SecureControlConnectionHandler> _logger;
 
     internal SecureControlConnectionHandler(
@@ -29,12 +30,14 @@ internal sealed class SecureControlConnectionHandler
         ControlCommandAuthorization authorization,
         ControlRequestReplayGuard replayGuard,
         IControlCommandDispatcher dispatcher,
+        TimeProvider timeProvider,
         ILogger<SecureControlConnectionHandler> logger)
     {
         _serviceInstance = serviceInstance ?? throw new ArgumentNullException(nameof(serviceInstance));
         _authorization = authorization ?? throw new ArgumentNullException(nameof(authorization));
         _replayGuard = replayGuard ?? throw new ArgumentNullException(nameof(replayGuard));
         _dispatcher = dispatcher ?? throw new ArgumentNullException(nameof(dispatcher));
+        _deadlines = new ControlTransportDeadlinePolicy(timeProvider);
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
 
@@ -62,16 +65,25 @@ internal sealed class SecureControlConnectionHandler
             return;
         }
 
-        await LengthPrefixedJsonProtocol.WriteGreetingAsync(
-            stream,
-            new ControlServerGreeting(ControlProtocolConstants.Version, _serviceInstance.Id),
-            cancellationToken);
+        try
+        {
+            await _deadlines.ExecuteGreetingAsync(token => LengthPrefixedJsonProtocol.WriteGreetingAsync(
+                stream,
+                new ControlServerGreeting(ControlProtocolConstants.Version, _serviceInstance.Id),
+                token), cancellationToken);
+        }
+        catch (ControlTransportDeadlineException)
+        {
+            return;
+        }
 
         ControlRequestEnvelope request;
         try
         {
-            request = await LengthPrefixedJsonProtocol.ReadRequestAsync(stream, cancellationToken);
+            request = await _deadlines.ExecuteRequestAsync(
+                token => LengthPrefixedJsonProtocol.ReadRequestAsync(stream, token), cancellationToken);
         }
+        catch (ControlTransportDeadlineException) { return; }
         catch (ControlProtocolException exception)
         {
             _logger.LogWarning("Control request was rejected with {ProtocolError}.", exception.Error);
@@ -145,29 +157,41 @@ internal sealed class SecureControlConnectionHandler
             result.Result);
         try
         {
-            await LengthPrefixedJsonProtocol.WriteResponseAsync(stream, response, cancellationToken);
+            await WriteResponseAsync(stream, response, cancellationToken);
         }
         catch (ControlProtocolException exception) when (exception.Error == ControlProtocolError.FrameTooLarge)
         {
             await WriteFailureAsync(stream, request, ControlErrorCode.ResponseTooLarge, cancellationToken);
         }
+        catch (ControlTransportDeadlineException) { }
     }
 
-    private Task WriteFailureAsync(
+    private async Task WriteFailureAsync(
         Stream stream,
         ControlRequestEnvelope request,
         ControlErrorCode error,
         CancellationToken cancellationToken)
-        => LengthPrefixedJsonProtocol.WriteResponseAsync(
-            stream,
-            new ControlResponseEnvelope(
+    {
+        try
+        {
+            await WriteResponseAsync(stream, new ControlResponseEnvelope(
                 ControlProtocolConstants.Version,
                 _serviceInstance.Id,
                 request.RequestId,
                 request.Command,
                 ControlOutcome.Failed,
                 error,
-                null),
+                null), cancellationToken);
+        }
+        catch (ControlTransportDeadlineException) { }
+    }
+
+    private Task WriteResponseAsync(
+        Stream stream,
+        ControlResponseEnvelope response,
+        CancellationToken cancellationToken)
+        => _deadlines.ExecuteResponseAsync(
+            token => LengthPrefixedJsonProtocol.WriteResponseAsync(stream, response, token),
             cancellationToken);
 
     private static bool IsValidResult(ControlCommand command, ControlDispatchResult result)

@@ -325,6 +325,42 @@ public sealed class ControlProtocolSecurityTests
     }
 
     [Fact]
+    public async Task OversizedResponseSerializationAllocationIsBoundedAndPublishesNothing()
+    {
+        var response = SnapshotResponse(new string('x', 32 * ControlProtocolConstants.MaximumResponseSize));
+        await using var stream = new MemoryStream();
+        var before = GC.GetAllocatedBytesForCurrentThread();
+
+        var exception = await Assert.ThrowsAsync<ControlProtocolException>(
+            () => LengthPrefixedJsonProtocol.WriteResponseAsync(stream, response));
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Equal(ControlProtocolError.FrameTooLarge, exception.Error);
+        Assert.InRange(allocated, 0, 4L * ControlProtocolConstants.MaximumResponseSize);
+        Assert.Equal(0, stream.Length);
+    }
+
+    [Fact]
+    public async Task CancellationAfterSerializationPreventsFirstFramePublication()
+    {
+        using var cancellation = new CancellationTokenSource();
+        await using var stream = new CancellationIgnoringWriteStream();
+
+        var method = typeof(LengthPrefixedJsonProtocol).GetMethod(
+            "WriteResponseForTestsAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!;
+        var operation = (Task)method.Invoke(null, new object[]
+        {
+            stream, Response(), (Action)cancellation.Cancel, cancellation.Token
+        })!;
+        var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(() => operation);
+
+        Assert.Equal(cancellation.Token, exception.CancellationToken);
+        Assert.Equal(0, stream.WriteCalls);
+        Assert.Equal(0, stream.BytesWritten);
+    }
+
+    [Fact]
     public async Task SnapshotResponseHonorsExactOneMiBBoundaryWithoutTruncationOrMultipleFrames()
     {
         await using var baseline = new MemoryStream();
@@ -558,6 +594,18 @@ public sealed class ControlProtocolSecurityTests
     {
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
             => base.ReadAsync(buffer[..Math.Min(1, buffer.Length)], cancellationToken);
+    }
+
+    private sealed class CancellationIgnoringWriteStream : MemoryStream
+    {
+        public int WriteCalls { get; private set; }
+        public long BytesWritten => Length;
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            WriteCalls++;
+            Write(buffer.Span);
+            return ValueTask.CompletedTask;
+        }
     }
 }
 
