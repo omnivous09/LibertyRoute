@@ -8,6 +8,24 @@ namespace LibertyRoute.Restoration.Tests;
 public sealed class ExactRouteReadbackTests
 {
     [Fact]
+    public void ExactImplementationIsOwnedByReusableReadOnlyAssembly()
+    {
+        var observationAssembly = typeof(ExactRouteVerifier).Assembly;
+        var toolAssembly = typeof(LibertyRoute.RouteObservation.Program).Assembly;
+
+        Assert.Equal("LibertyRoute.RouteObservation", observationAssembly.GetName().Name);
+        Assert.Equal("LibertyRoute.RouteObservation.Tool", toolAssembly.GetName().Name);
+        Assert.NotSame(observationAssembly, toolAssembly);
+        Assert.Contains(toolAssembly.GetReferencedAssemblies(),
+            reference => StringComparer.Ordinal.Equals(reference.Name, observationAssembly.GetName().Name));
+
+        var references = observationAssembly.GetReferencedAssemblies().Select(reference => reference.Name).ToArray();
+        Assert.DoesNotContain("LibertyRoute.Restoration", references);
+        Assert.DoesNotContain("LibertyRoute.Restoration.Windows", references);
+        Assert.DoesNotContain("LibertyRoute.Service", references);
+    }
+
+    [Fact]
     public void NativeAbiLayoutMatchesSupportedWindowsLayout()
     {
         Assert.Equal(8, Marshal.SizeOf<ulong>());

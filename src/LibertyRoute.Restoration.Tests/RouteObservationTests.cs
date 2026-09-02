@@ -181,10 +181,11 @@ public sealed class RouteObservationTests
     {
         var assembly = typeof(RouteCandidatePolicy).Assembly;
         var libertyRouteReferences = assembly.GetReferencedAssemblies()
-            .Select(reference => reference.Name).Where(name => name?.StartsWith("LibertyRoute.", StringComparison.Ordinal) == true).ToArray();
-        Assert.Empty(libertyRouteReferences);
+            .Select(reference => reference.Name).OfType<string>()
+            .Where(name => name.StartsWith("LibertyRoute.", StringComparison.Ordinal)).ToArray();
+        Assert.Equal(["LibertyRoute.RouteObservation"], libertyRouteReferences);
 
-        var nativeImports = assembly.GetTypes()
+        var toolNativeImports = assembly.GetTypes()
             .SelectMany(type => type.GetMethods(
                 System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public |
                 System.Reflection.BindingFlags.NonPublic))
@@ -194,10 +195,25 @@ public sealed class RouteObservationTests
             .Select(item => $"{item.Import!.Value}!{item.Method.Name}")
             .Order(StringComparer.Ordinal)
             .ToArray();
-        Assert.Equal(["iphlpapi.dll!FreeMibTable", "iphlpapi.dll!GetIpForwardTable2"], nativeImports);
+        Assert.Empty(toolNativeImports);
+
+        var observationAssembly = typeof(ExactRouteVerifier).Assembly;
+        var observationNativeImports = observationAssembly.GetTypes()
+            .SelectMany(type => type.GetMethods(
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic))
+            .Select(method => (Method: method, Import: method.GetCustomAttributes(typeof(DllImportAttribute), false)
+                .Cast<DllImportAttribute>().SingleOrDefault()))
+            .Where(item => item.Import is not null)
+            .Select(item => $"{item.Import!.Value}!{item.Method.Name}")
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        Assert.Equal(["iphlpapi.dll!FreeMibTable", "iphlpapi.dll!GetIpForwardTable2"], observationNativeImports);
 
         var project = File.ReadAllText(FindRepositoryFile("tools", "LibertyRoute.RouteObservation", "LibertyRoute.RouteObservation.csproj"));
-        Assert.DoesNotContain("ProjectReference", project, StringComparison.Ordinal);
+        Assert.Contains("src\\LibertyRoute.RouteObservation\\LibertyRoute.RouteObservation.csproj", project, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.Restoration", project, StringComparison.Ordinal);
+        Assert.DoesNotContain("LibertyRoute.Service", project, StringComparison.Ordinal);
 
         var source = File.ReadAllText(FindRepositoryFile("tools", "LibertyRoute.RouteObservation", "Program.cs"));
         foreach (var forbidden in ForbiddenMutationSymbols)
