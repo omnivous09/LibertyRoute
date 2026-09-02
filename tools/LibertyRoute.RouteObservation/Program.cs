@@ -307,7 +307,7 @@ internal static class StrictWindowsRouteObserver
     private static FamilyResult ObserveFamily(
         int family, string label, int remainingCapacity, ICollection<CanonicalRouteObservation> routes, ICollection<string> reasons)
     {
-        var status = GetIpForwardTable2(family, out var table);
+        var status = ExactRouteNativeMethods.GetIpForwardTable2(family, out var table);
         if (status != 0)
         {
             reasons.Add($"{label} route enumeration failed with native status {status}.");
@@ -352,7 +352,7 @@ internal static class StrictWindowsRouteObserver
         }
         finally
         {
-            FreeMibTable(table);
+            ExactRouteNativeMethods.FreeMibTable(table);
         }
     }
 
@@ -368,12 +368,6 @@ internal static class StrictWindowsRouteObserver
     }
 
     private readonly record struct FamilyResult(bool Complete, bool Truncated);
-
-    [DllImport("iphlpapi.dll", ExactSpelling = true)]
-    private static extern int GetIpForwardTable2(int addressFamily, out IntPtr table);
-
-    [DllImport("iphlpapi.dll", ExactSpelling = true)]
-    private static extern void FreeMibTable(IntPtr memory);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MibIpForwardTable2
