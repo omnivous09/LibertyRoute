@@ -1,7 +1,9 @@
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using LibertyRoute.Core;
 using LibertyRoute.Restoration.Windows;
 using Xunit;
@@ -76,6 +78,22 @@ public sealed class OwnershipLedgerTests : IAsyncLifetime
             purpose,
             recoveryAttemptId,
             authorizationEvidenceId);
+
+    private static PersistedOwnedChange ExactRecord(
+        Guid? changeId = null, OwnedChangeLifecycle lifecycle = OwnedChangeLifecycle.Planned)
+        => PersistedOwnedChange.CreateExactRoute(SessionA, changeId ?? Guid.NewGuid(),
+            DryRunOperationCategory.Route, "route-192.0.2.0/24", RouteValue, "<absent>",
+            RecordedAt, 1, OwnershipEvidenceSource.MutationLedger, lifecycle,
+            new ExactRouteMutationIdentity(1,
+                NativeRouteKey.Create(NativeRouteAddressFamily.IPv4, IPAddress.Parse("192.0.2.0"), 24,
+                    IPAddress.Parse("192.0.2.1"), 42),
+                new NativeRouteProfile(24, 3600, 1800, 5, 3, false, true, false, false)),
+            Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+
+    private static PersistedOwnedChange ResignExact(PersistedOwnedChange record) => record with
+    {
+        ExactRouteEvidenceFingerprint = ExactRouteOwnershipEvidenceBinding.ComputeFingerprint(record)
+    };
 
     private static async Task WriteRawLedgerAsync(string root, Guid sessionId, string payload)
     {
@@ -532,7 +550,8 @@ public sealed class OwnershipLedgerTests : IAsyncLifetime
             typeof(DryRunOperationCategory),
             typeof(OwnershipEvidenceSource),
             typeof(OwnedChangeLifecycle),
-            typeof(RecordPurpose)
+            typeof(RecordPurpose),
+            typeof(ExactRouteMutationIdentity)
         };
 
         var properties = typeof(PersistedOwnedChange).GetProperties();
@@ -1146,4 +1165,241 @@ public sealed class OwnershipLedgerTests : IAsyncLifetime
         Assert.Equal(attempt, final.RecoveryAttemptId);
         Assert.Equal(evidence, final.AuthorizationEvidenceId);
     }
+
+    [Fact]
+    public async Task ExactEvidenceRoundTripsAndSurvivesEveryLifecycleTransition()
+    {
+        var ledger = NewLedger();
+        var planned = ExactRecord();
+        await ledger.AppendAsync(planned, CancellationToken.None);
+        var applied = planned with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true };
+        await ledger.AppendAsync(applied, CancellationToken.None);
+        var reverted = applied with { Lifecycle = OwnedChangeLifecycle.Reverted, IsComplete = false };
+        await ledger.AppendAsync(reverted, CancellationToken.None);
+
+        var stored = Assert.Single(await ledger.ReadForSessionAsync(SessionA, CancellationToken.None));
+        Assert.Equal(reverted, stored);
+        Assert.NotNull(stored.ExactRouteIdentity);
+        Assert.NotNull(stored.ExactRouteEvidenceFingerprint);
+    }
+
+    [Fact]
+    public async Task ExactEvidenceCannotBeEnrichedStrippedOrChangedDuringTransition()
+    {
+        var ledger = NewLedger();
+        var legacy = Record();
+        await ledger.AppendAsync(legacy, CancellationToken.None);
+        var exactTemplate = ExactRecord();
+        var enriched = PersistedOwnedChange.CreateExactRoute(legacy.SessionId, legacy.ChangeId,
+            legacy.Category, legacy.TargetIdentity, legacy.OriginalValue, legacy.AppliedValue,
+            legacy.RecordedAtUtc, legacy.SequenceNumber, legacy.EvidenceSource,
+            OwnedChangeLifecycle.Applied, exactTemplate.ExactRouteIdentity!, exactTemplate.MutationAttemptId!.Value);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ledger.AppendAsync(enriched, CancellationToken.None));
+
+        var exact = ExactRecord();
+        await ledger.AppendAsync(exact, CancellationToken.None);
+        var stripped = exact with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true,
+            ExactRouteEvidenceVersion = null, ExactRouteIdentity = null, MutationAttemptId = null,
+            ExactRouteEvidenceFingerprint = null };
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ledger.AppendAsync(stripped, CancellationToken.None));
+        Assert.Equal(legacy, (await ledger.ReadForSessionAsync(SessionA, CancellationToken.None))
+            .Single(record => record.ChangeId == legacy.ChangeId));
+        Assert.Equal(exact, (await ledger.ReadForSessionAsync(SessionA, CancellationToken.None))
+            .Single(record => record.ChangeId == exact.ChangeId));
+    }
+
+    [Fact]
+    public async Task PartialAndTamperedExactEvidenceFailAtWriteAndReadBoundaries()
+    {
+        var exact = ExactRecord();
+        var partial = Record() with { ExactRouteEvidenceVersion = 1 };
+        await Assert.ThrowsAsync<InvalidOperationException>(() => NewLedger().AppendAsync(partial, CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => NewLedger().AppendAsync(exact with
+            { ExactRouteEvidenceFingerprint = new string('A', 64) }, CancellationToken.None));
+
+        await WriteRawLedgerAsync(_root, SessionA, JsonSerializer.Serialize(new[] { partial }, RawJsonOptions));
+        await Assert.ThrowsAsync<InvalidDataException>(() => NewLedger().ReadForSessionAsync(SessionA, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ConditionalWriteRejectsMalformedExactEvidenceWithoutPublishing()
+    {
+        var ledger = NewLedger();
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var partial = Record() with { MutationAttemptId = Guid.NewGuid() };
+        await Assert.ThrowsAsync<ArgumentException>(() => ledger.TryApplyTransitionsAsync(
+            SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(partial.ChangeId, null, partial) }, CancellationToken.None));
+        var after = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        Assert.Equal(snapshot.LedgerRevision, after.LedgerRevision);
+        Assert.Empty(after.Records);
+    }
+
+    [Theory]
+    [InlineData("partial")]
+    [InlineData("unknown-version")]
+    [InlineData("invalid-core")]
+    [InlineData("empty-attempt")]
+    [InlineData("recovery-hybrid")]
+    [InlineData("wrong-fingerprint")]
+    [InlineData("non-utc")]
+    public async Task EveryMalformedExactShapeFailsAtDurableReadBoundary(string malformedCase)
+    {
+        var node = JsonSerializer.SerializeToNode(ExactRecord(), RawJsonOptions)!.AsObject();
+        switch (malformedCase)
+        {
+            case "partial":
+                node.Remove("exactRouteIdentity");
+                break;
+            case "unknown-version":
+                node["exactRouteEvidenceVersion"] = 2;
+                break;
+            case "invalid-core":
+                node["exactRouteIdentity"]!["profile"]!["protocol"] = 4;
+                break;
+            case "empty-attempt":
+                node["mutationAttemptId"] = Guid.Empty;
+                break;
+            case "recovery-hybrid":
+                node["purpose"] = (int)RecordPurpose.RecoveryMutation;
+                node["recoveryAttemptId"] = Guid.NewGuid();
+                node["authorizationEvidenceId"] = Guid.NewGuid();
+                break;
+            case "wrong-fingerprint":
+                node["exactRouteEvidenceFingerprint"] = new string('A', 64);
+                break;
+            default:
+                node["recordedAtUtc"] = "2026-08-26T08:00:00+08:00";
+                break;
+        }
+        var payload = new JsonArray(node).ToJsonString(RawJsonOptions);
+        await WriteRawLedgerAsync(_root, SessionA, payload);
+        var exception = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            NewLedger().ReadForSessionAsync(SessionA, CancellationToken.None));
+        if (malformedCase == "invalid-core")
+            Assert.IsAssignableFrom<ArgumentException>(exception.InnerException);
+    }
+
+    [Fact]
+    public async Task CancelledPublicReadRemainsCancellation()
+    {
+        await NewLedger().AppendAsync(Record(), CancellationToken.None);
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            NewLedger().ReadForSessionAsync(SessionA, cancellation.Token));
+    }
+
+    [Theory]
+    [InlineData("legacy-applied-to-exact-reverted")]
+    [InlineData("exact-applied-to-legacy-reverted")]
+    public async Task AppendRejectsLateLifecycleEnrichmentAndStrippingWithoutPublication(string direction)
+    {
+        var ledger = NewLedger();
+        PersistedOwnedChange initial;
+        PersistedOwnedChange proposed;
+        if (direction.StartsWith("legacy", StringComparison.Ordinal))
+        {
+            initial = Record(lifecycle: OwnedChangeLifecycle.Applied);
+            var template = ExactRecord();
+            proposed = PersistedOwnedChange.CreateExactRoute(initial.SessionId, initial.ChangeId,
+                initial.Category, initial.TargetIdentity, initial.OriginalValue, initial.AppliedValue,
+                initial.RecordedAtUtc, initial.SequenceNumber, initial.EvidenceSource,
+                OwnedChangeLifecycle.Reverted, template.ExactRouteIdentity!, template.MutationAttemptId!.Value);
+        }
+        else
+        {
+            initial = ExactRecord(lifecycle: OwnedChangeLifecycle.Applied);
+            proposed = PersistedOwnedChange.Create(initial.SessionId, initial.ChangeId, initial.Category,
+                initial.TargetIdentity, initial.OriginalValue, initial.AppliedValue, initial.RecordedAtUtc,
+                initial.SequenceNumber, initial.EvidenceSource, OwnedChangeLifecycle.Reverted);
+        }
+        await ledger.AppendAsync(initial, CancellationToken.None);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ledger.AppendAsync(proposed, CancellationToken.None));
+        Assert.Equal(initial, Assert.Single(await ledger.ReadForSessionAsync(SessionA, CancellationToken.None)));
+    }
+
+    [Theory]
+    [InlineData("identity")]
+    [InlineData("attempt")]
+    [InlineData("fingerprint")]
+    [InlineData("version")]
+    public async Task AppendRejectsEveryExactFieldSubstitutionWithoutPublication(string field)
+    {
+        var ledger = NewLedger();
+        var planned = ExactRecord();
+        await ledger.AppendAsync(planned, CancellationToken.None);
+        var proposed = planned with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true };
+        proposed = field switch
+        {
+            "identity" => ResignExact(proposed with { ExactRouteIdentity = VaryIdentity(planned.ExactRouteIdentity!) }),
+            "attempt" => ResignExact(proposed with { MutationAttemptId = Guid.NewGuid() }),
+            "fingerprint" => proposed with { ExactRouteEvidenceFingerprint = new string('A', 64) },
+            _ => proposed with { ExactRouteEvidenceVersion = 2 }
+        };
+        await Assert.ThrowsAnyAsync<Exception>(() => ledger.AppendAsync(proposed, CancellationToken.None));
+        Assert.Equal(planned, Assert.Single(await ledger.ReadForSessionAsync(SessionA, CancellationToken.None)));
+    }
+
+    [Theory]
+    [InlineData("enrich")]
+    [InlineData("strip")]
+    public async Task CasRejectsExactShapeEnrichmentAndStrippingAtCurrentRevision(string mode)
+    {
+        var ledger = NewLedger();
+        var template = ExactRecord();
+        var initial = mode == "enrich" ? Record() : template;
+        await ledger.AppendAsync(initial, CancellationToken.None);
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        PersistedOwnedChange proposed = mode == "enrich"
+            ? PersistedOwnedChange.CreateExactRoute(initial.SessionId, initial.ChangeId, initial.Category,
+                initial.TargetIdentity, initial.OriginalValue, initial.AppliedValue, initial.RecordedAtUtc,
+                initial.SequenceNumber, initial.EvidenceSource, OwnedChangeLifecycle.Applied,
+                template.ExactRouteIdentity!, template.MutationAttemptId!.Value)
+            : PersistedOwnedChange.Create(initial.SessionId, initial.ChangeId, initial.Category,
+                initial.TargetIdentity, initial.OriginalValue, initial.AppliedValue, initial.RecordedAtUtc,
+                initial.SequenceNumber, initial.EvidenceSource, OwnedChangeLifecycle.Applied);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ledger.TryApplyTransitionsAsync(
+            SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(initial.ChangeId, OwnedChangeLifecycle.Planned, proposed) },
+            CancellationToken.None));
+        var after = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        Assert.Equal(snapshot.LedgerRevision, after.LedgerRevision);
+        Assert.Equal(initial, Assert.Single(after.Records));
+    }
+
+    [Theory]
+    [InlineData("identity", false)]
+    [InlineData("attempt", false)]
+    [InlineData("fingerprint", true)]
+    [InlineData("version", true)]
+    public async Task CasRejectsEveryExactFieldSubstitutionAtCurrentRevision(string field, bool validationRejectsFirst)
+    {
+        var ledger = NewLedger();
+        var planned = ExactRecord();
+        await ledger.AppendAsync(planned, CancellationToken.None);
+        var snapshot = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        var proposed = planned with { Lifecycle = OwnedChangeLifecycle.Applied, IsComplete = true };
+        proposed = field switch
+        {
+            "identity" => ResignExact(proposed with { ExactRouteIdentity = VaryIdentity(planned.ExactRouteIdentity!) }),
+            "attempt" => ResignExact(proposed with { MutationAttemptId = Guid.NewGuid() }),
+            "fingerprint" => proposed with { ExactRouteEvidenceFingerprint = new string('A', 64) },
+            _ => proposed with { ExactRouteEvidenceVersion = 2 }
+        };
+        var exception = await Xunit.Record.ExceptionAsync(() => ledger.TryApplyTransitionsAsync(
+            SessionA, snapshot.LedgerRevision,
+            new[] { new OwnershipRecordTransition(planned.ChangeId, OwnedChangeLifecycle.Planned, proposed) },
+            CancellationToken.None));
+        Assert.IsType(validationRejectsFirst ? typeof(ArgumentException) : typeof(InvalidOperationException), exception);
+        var after = await ledger.ReadVersionedAsync(SessionA, CancellationToken.None);
+        Assert.Equal(snapshot.LedgerRevision, after.LedgerRevision);
+        Assert.Equal(planned, Assert.Single(after.Records));
+    }
+
+    private static ExactRouteMutationIdentity VaryIdentity(ExactRouteMutationIdentity identity) => new(
+        identity.SchemaVersion,
+        new NativeRouteKey(identity.Key.AddressFamily, "C6336400", identity.Key.DestinationPrefixLength,
+            identity.Key.NextHopAddress, identity.Key.NextHopScopeId, identity.Key.InterfaceLuid),
+        identity.Profile);
 }

@@ -1,4 +1,6 @@
 using Xunit;
+using System.Net;
+using LibertyRoute.Core;
 
 namespace LibertyRoute.Restoration.Tests;
 
@@ -67,6 +69,16 @@ public sealed class OwnershipLedgerAuthorizationIntegrationTests : IAsyncLifetim
             operation.ExecutionOrder,
             OwnershipEvidenceSource.MutationLedger,
             lifecycle);
+
+    private static PersistedOwnedChange ExactLedgerRecordFor(DryRunRestorationOperation operation)
+        => PersistedOwnedChange.CreateExactRoute(SessionId, Guid.NewGuid(), operation.Category,
+            operation.TargetIdentity, operation.OriginalValue, operation.CurrentValue, RecordedAt,
+            operation.ExecutionOrder, OwnershipEvidenceSource.MutationLedger, OwnedChangeLifecycle.Applied,
+            new ExactRouteMutationIdentity(1,
+                NativeRouteKey.Create(NativeRouteAddressFamily.IPv4, IPAddress.Parse("192.0.2.0"), 24,
+                    IPAddress.Parse("192.0.2.1"), 42),
+                new NativeRouteProfile(24, 3600, 1800, 5, 3, false, false, false, false)),
+            Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
 
     [Fact]
     public async Task AppliedLedgerEvidenceAuthorizesExactMatchingOperation()
@@ -168,6 +180,24 @@ public sealed class OwnershipLedgerAuthorizationIntegrationTests : IAsyncLifetim
         var decision = RestorationAuthorizationPolicy.Authorize(operation, new[] { evidence }, SessionId);
 
         Assert.Equal(OperationAuthorizationStatus.DeniedOwnershipMismatch, decision.Status);
+    }
+
+    [Fact]
+    public async Task ExactStructuralEvidenceDoesNotCreateASeparateGenericAuthorizationPath()
+    {
+        var ledger = new FileOwnershipLedger(_root);
+        var operation = BaselineRouteOperation();
+        await ledger.AppendAsync(ExactLedgerRecordFor(operation), CancellationToken.None);
+
+        var stored = Assert.Single(await ledger.ReadForSessionAsync(SessionId, CancellationToken.None));
+        Assert.True(stored.HasValidAppliedExactRouteOwnershipEvidence);
+        var decision = RestorationAuthorizationPolicy.Authorize(
+            operation, new[] { stored.ToOwnershipEvidence() }, SessionId);
+        Assert.Equal(OperationAuthorizationStatus.Authorized, decision.Status);
+
+        var tampered = stored with { ExactRouteEvidenceFingerprint = new string('0', 64) };
+        Assert.False(tampered.HasValidAppliedExactRouteOwnershipEvidence);
+        Assert.Equal(stored.ToOwnershipEvidence(), tampered.ToOwnershipEvidence());
     }
 
 }

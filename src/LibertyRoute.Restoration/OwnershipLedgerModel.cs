@@ -1,3 +1,5 @@
+using LibertyRoute.Core;
+
 namespace LibertyRoute.Restoration;
 
 public enum RecordPurpose
@@ -75,10 +77,19 @@ public sealed record PersistedOwnedChange(
     bool IsComplete,
     RecordPurpose Purpose = RecordPurpose.SessionMutation,
     Guid? RecoveryAttemptId = null,
-    Guid? AuthorizationEvidenceId = null)
+    Guid? AuthorizationEvidenceId = null,
+    int? ExactRouteEvidenceVersion = null,
+    ExactRouteMutationIdentity? ExactRouteIdentity = null,
+    Guid? MutationAttemptId = null,
+    string? ExactRouteEvidenceFingerprint = null)
 {
+    public const int CurrentExactRouteEvidenceVersion = 1;
+
     public bool IsRecoveryMutation => Purpose == RecordPurpose.RecoveryMutation;
     public bool HasRecoveryProvenance => Purpose == RecordPurpose.RecoveryMutation && RecoveryAttemptId.HasValue && AuthorizationEvidenceId.HasValue;
+    public bool HasValidAppliedExactRouteOwnershipEvidence =>
+        Lifecycle == OwnedChangeLifecycle.Applied && IsComplete &&
+        ExactRouteEvidenceVersion.HasValue && string.IsNullOrEmpty(Validate(this));
 
     public Guid DeriveOwnershipChangeId(string operationIdentity)
         => MutationOwnershipCoordinator.DeriveChangeId(SessionId, operationIdentity);
@@ -206,6 +217,27 @@ public sealed record PersistedOwnedChange(
         return true;
     }
 
+    public static PersistedOwnedChange CreateExactRoute(
+        Guid sessionId, Guid changeId, DryRunOperationCategory category,
+        string targetIdentity, string originalValue, string appliedValue,
+        DateTimeOffset recordedAtUtc, int? sequenceNumber,
+        OwnershipEvidenceSource evidenceSource, OwnedChangeLifecycle lifecycle,
+        ExactRouteMutationIdentity exactRouteIdentity, Guid mutationAttemptId)
+    {
+        var unsigned = new PersistedOwnedChange(
+            sessionId, changeId, category, targetIdentity, originalValue, appliedValue,
+            recordedAtUtc, sequenceNumber, evidenceSource, lifecycle,
+            lifecycle == OwnedChangeLifecycle.Applied, RecordPurpose.SessionMutation,
+            null, null, CurrentExactRouteEvidenceVersion, exactRouteIdentity,
+            mutationAttemptId, string.Empty);
+        var fingerprint = ExactRouteOwnershipEvidenceBinding.ComputeFingerprint(unsigned);
+        var record = unsigned with { ExactRouteEvidenceFingerprint = fingerprint };
+        var failure = Validate(record);
+        if (!string.IsNullOrEmpty(failure))
+            throw new InvalidOperationException(failure);
+        return record;
+    }
+
     /// <summary>
     /// Validates a record instance, including records read back from storage or handed
     /// directly to a ledger. Every persistence boundary re-validates and fails closed.
@@ -227,7 +259,11 @@ public sealed record PersistedOwnedChange(
             record.IsComplete,
             record.Purpose,
             record.RecoveryAttemptId,
-            record.AuthorizationEvidenceId);
+            record.AuthorizationEvidenceId,
+            record.ExactRouteEvidenceVersion,
+            record.ExactRouteIdentity,
+            record.MutationAttemptId,
+            record.ExactRouteEvidenceFingerprint);
     }
 
     /// <summary>
@@ -265,7 +301,11 @@ public sealed record PersistedOwnedChange(
            EvidenceSource == other.EvidenceSource &&
            Purpose == other.Purpose &&
            Nullable.Equals(RecoveryAttemptId, other.RecoveryAttemptId) &&
-           Nullable.Equals(AuthorizationEvidenceId, other.AuthorizationEvidenceId);
+           Nullable.Equals(AuthorizationEvidenceId, other.AuthorizationEvidenceId) &&
+           Nullable.Equals(ExactRouteEvidenceVersion, other.ExactRouteEvidenceVersion) &&
+           Equals(ExactRouteIdentity, other.ExactRouteIdentity) &&
+           Nullable.Equals(MutationAttemptId, other.MutationAttemptId) &&
+           StringComparer.Ordinal.Equals(ExactRouteEvidenceFingerprint, other.ExactRouteEvidenceFingerprint);
 
     /// <summary>
     /// Only forward single-step lifecycle advances are valid:
@@ -289,7 +329,11 @@ public sealed record PersistedOwnedChange(
         bool? isComplete,
         RecordPurpose purpose,
         Guid? recoveryAttemptId,
-        Guid? authorizationEvidenceId)
+        Guid? authorizationEvidenceId,
+        int? exactRouteEvidenceVersion = null,
+        ExactRouteMutationIdentity? exactRouteIdentity = null,
+        Guid? mutationAttemptId = null,
+        string? exactRouteEvidenceFingerprint = null)
     {
         if (sessionId == Guid.Empty)
             return "Session id is required.";
@@ -326,6 +370,40 @@ public sealed record PersistedOwnedChange(
                 return "Recovery mutation provenance requires a non-empty RecoveryAttemptId.";
             if (!authorizationEvidenceId.HasValue || authorizationEvidenceId.Value == Guid.Empty)
                 return "Recovery mutation provenance requires a non-empty AuthorizationEvidenceId.";
+        }
+        var exactFieldCount = (exactRouteEvidenceVersion.HasValue ? 1 : 0) +
+            (exactRouteIdentity is not null ? 1 : 0) + (mutationAttemptId.HasValue ? 1 : 0) +
+            (exactRouteEvidenceFingerprint is not null ? 1 : 0);
+        if (exactFieldCount is > 0 and < 4)
+            return "Exact-route ownership evidence must be wholly absent or wholly present.";
+        if (exactFieldCount == 4)
+        {
+            if (purpose != RecordPurpose.SessionMutation)
+                return "Exact-route ownership evidence is permitted only for session mutations.";
+            if (exactRouteEvidenceVersion != CurrentExactRouteEvidenceVersion)
+                return "Exact-route ownership evidence version is unsupported.";
+            if (mutationAttemptId == Guid.Empty)
+                return "Exact-route ownership evidence requires a non-empty mutation attempt id.";
+            if (recordedAtUtc.Offset != TimeSpan.Zero)
+                return "Exact-route ownership evidence requires a UTC recorded timestamp.";
+            try
+            {
+                exactRouteIdentity!.Profile.ValidateFor(exactRouteIdentity.Key);
+            }
+            catch (Exception exception) when (exception is ArgumentException or InvalidOperationException)
+            {
+                return $"Exact-route identity is invalid: {exception.Message}";
+            }
+            if (!ExactRouteOwnershipEvidenceBinding.IsCanonicalFingerprint(exactRouteEvidenceFingerprint!))
+                return "Exact-route ownership evidence fingerprint must be 64 uppercase hexadecimal characters.";
+
+            var unsigned = new PersistedOwnedChange(sessionId, changeId, category, targetIdentity,
+                originalValue, appliedValue, recordedAtUtc, sequenceNumber, evidenceSource, lifecycle,
+                lifecycle == OwnedChangeLifecycle.Applied, purpose, recoveryAttemptId,
+                authorizationEvidenceId, exactRouteEvidenceVersion, exactRouteIdentity,
+                mutationAttemptId, exactRouteEvidenceFingerprint);
+            if (!ExactRouteOwnershipEvidenceBinding.FingerprintMatches(unsigned))
+                return "Exact-route ownership evidence fingerprint does not match its bound fields.";
         }
         if (isComplete.HasValue && isComplete.Value != (lifecycle == OwnedChangeLifecycle.Applied))
             return "Completeness must reflect the current lifecycle: only Applied changes are complete.";

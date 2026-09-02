@@ -234,6 +234,14 @@ public sealed class FileOwnershipLedger : IConditionalOwnershipLedger
         {
             throw new InvalidDataException("Ownership ledger payload is malformed.", exception);
         }
+        catch (ArgumentException exception)
+        {
+            throw new InvalidDataException("Ownership ledger payload is semantically invalid.", exception);
+        }
+        catch (InvalidOperationException exception)
+        {
+            throw new InvalidDataException("Ownership ledger payload is semantically invalid.", exception);
+        }
 
         ValidateRecords(sessionId, records, durableState: true);
 
