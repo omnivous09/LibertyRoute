@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Runtime.InteropServices;
+using LibertyRoute.Core;
 using LibertyRoute.RouteObservation;
 
 namespace LibertyRoute.Restoration.Tests;
@@ -20,6 +21,7 @@ public sealed class ExactRouteReadbackTests
             reference => StringComparer.Ordinal.Equals(reference.Name, observationAssembly.GetName().Name));
 
         var references = observationAssembly.GetReferencedAssemblies().Select(reference => reference.Name).ToArray();
+        Assert.Contains("LibertyRoute.Core", references);
         Assert.DoesNotContain("LibertyRoute.Restoration", references);
         Assert.DoesNotContain("LibertyRoute.Restoration.Windows", references);
         Assert.DoesNotContain("LibertyRoute.Service", references);
@@ -64,8 +66,8 @@ public sealed class ExactRouteReadbackTests
     {
         var raw = RawRow(NativeRouteAddressFamily.IPv4, "192.0.2.99", 32, "0.0.0.0", 0);
         var decoded = DecodeRawRow(raw, NativeRouteAddressFamily.IPv4);
-        Assert.Equal("192.0.2.99", decoded.Key.DestinationAddress);
-        Assert.Equal("0.0.0.0", decoded.Key.NextHopAddress);
+        Assert.Equal("C0000263", decoded.Key.DestinationAddress);
+        Assert.Equal("00000000", decoded.Key.NextHopAddress);
         Assert.Equal(42UL, decoded.Key.InterfaceLuid);
         Assert.Equal(7U, decoded.InterfaceIndex);
         Assert.Equal(uint.MaxValue, decoded.PreferredLifetime);
@@ -77,27 +79,27 @@ public sealed class ExactRouteReadbackTests
     {
         var raw = RawRow(NativeRouteAddressFamily.IPv6, "2001:db8::1", 128, "fe80::1", 0xfedcba98);
         var decoded = DecodeRawRow(raw, NativeRouteAddressFamily.IPv6);
-        Assert.Equal("2001:db8::1", decoded.Key.DestinationAddress);
-        Assert.Equal("fe80::1", decoded.Key.NextHopAddress);
-        Assert.Equal(0xfedcba98, decoded.Key.NextHopScopeId);
+        Assert.Equal("20010DB8000000000000000000000001", decoded.Key.DestinationAddress);
+        Assert.Equal("FE800000000000000000000000000001", decoded.Key.NextHopAddress);
+        Assert.Equal(0xfedcba98U, decoded.Key.NextHopScopeId);
     }
 
     [Fact]
     public void Ipv4FixtureDecodesCanonically()
     {
         var decoded = NativeRouteDecoder.Decode(NativeRow("192.0.2.99", 32, "0.0.0.0"), NativeRouteAddressFamily.IPv4);
-        Assert.Equal("192.0.2.99", decoded.Key.DestinationAddress);
-        Assert.Equal("0.0.0.0", decoded.Key.NextHopAddress);
-        Assert.Equal(0, decoded.Key.NextHopScopeId);
+        Assert.Equal("C0000263", decoded.Key.DestinationAddress);
+        Assert.Equal("00000000", decoded.Key.NextHopAddress);
+        Assert.Equal(0U, decoded.Key.NextHopScopeId);
     }
 
     [Fact]
     public void Ipv6FixturePreservesNextHopScopeAndCanonicalizes()
     {
         var decoded = NativeRouteDecoder.Decode(NativeRow("2001:0db8:0:0:0:0:0:1", 128, "fe80::1", scope: 17), NativeRouteAddressFamily.IPv6);
-        Assert.Equal("2001:db8::1", decoded.Key.DestinationAddress);
-        Assert.Equal("fe80::1", decoded.Key.NextHopAddress);
-        Assert.Equal(17, decoded.Key.NextHopScopeId);
+        Assert.Equal("20010DB8000000000000000000000001", decoded.Key.DestinationAddress);
+        Assert.Equal("FE800000000000000000000000000001", decoded.Key.NextHopAddress);
+        Assert.Equal(17U, decoded.Key.NextHopScopeId);
     }
 
     [Fact]
@@ -136,7 +138,7 @@ public sealed class ExactRouteReadbackTests
     public void ExactlyOneFullAcceptableMatchIsVerified()
     {
         var row = Row();
-        var result = ExactRouteVerifier.VerifyPresent(Complete(row), row.Key, Profile(row));
+        var result = ExactRouteVerifier.VerifyPresent(Complete(row), row);
         Assert.Equal(ExactRouteVerificationStatus.VerifiedPresent, result.Status);
         Assert.Equal(1, result.FullKeyMatchCount);
         Assert.Equal(1, result.ReducedIdentityMatchCount);
@@ -148,7 +150,7 @@ public sealed class ExactRouteReadbackTests
         var expected = Row();
         var other = Row("198.51.100.1");
         Assert.Equal(ExactRouteVerificationStatus.NoMatch,
-            ExactRouteVerifier.VerifyPresent(Complete(other), expected.Key, Profile(expected)).Status);
+            ExactRouteVerifier.VerifyPresent(Complete(other), expected).Status);
     }
 
     [Fact]
@@ -156,22 +158,56 @@ public sealed class ExactRouteReadbackTests
     {
         var row = Row();
         Assert.Equal(ExactRouteVerificationStatus.DuplicateFullKeyMatches,
-            ExactRouteVerifier.VerifyPresent(Complete(row, row), row.Key, Profile(row)).Status);
+            ExactRouteVerifier.VerifyPresent(Complete(row, row), row).Status);
     }
 
     [Fact]
     public void ReducedIdentityCollisionIsRejected()
     {
         var expected = Row();
-        var collision = Row() with { Key = Row().Key with { InterfaceLuid = 999 } };
+        var collision = WithKey(Row(), NativeRouteKey.Create(NativeRouteAddressFamily.IPv4,
+            IPAddress.Parse("192.0.2.1"), 32, IPAddress.Any, 999));
         Assert.Equal(ExactRouteVerificationStatus.ReducedIdentityCollision,
-            ExactRouteVerifier.VerifyPresent(Complete(expected, collision), expected.Key, Profile(expected)).Status);
+            ExactRouteVerifier.VerifyPresent(Complete(expected, collision), expected).Status);
+    }
+
+    [Theory]
+    [InlineData("destination", ExactRouteVerificationStatus.NoMatch)]
+    [InlineData("prefix", ExactRouteVerificationStatus.NoMatch)]
+    [InlineData("nextHop", ExactRouteVerificationStatus.ReducedIdentityCollision)]
+    [InlineData("scope", ExactRouteVerificationStatus.ReducedIdentityCollision)]
+    [InlineData("luid", ExactRouteVerificationStatus.ReducedIdentityCollision)]
+    public void EveryIndependentlyRepresentableFullKeyComponentAffectsVerification(
+        string field, ExactRouteVerificationStatus expectedStatus)
+    {
+        var expected = RowV6("2001:db8::", 128, "fe80::1", 1, 42);
+        var changedKey = field switch
+        {
+            "destination" => KeyV6("2001:db8::1", 128, "fe80::1", 1, 42),
+            "prefix" => KeyV6("2001:db8::", 127, "fe80::1", 1, 42),
+            "nextHop" => KeyV6("2001:db8::", 128, "fe80::2", 1, 42),
+            "scope" => KeyV6("2001:db8::", 128, "fe80::1", 2, 42),
+            _ => KeyV6("2001:db8::", 128, "fe80::1", 1, 43)
+        };
+        var observed = WithKey(expected, changedKey);
+
+        Assert.NotEqual(expected.Key, observed.Key);
+        Assert.Equal(expectedStatus, ExactRouteVerifier.VerifyPresent(Complete(observed), expected).Status);
+    }
+
+    [Fact]
+    public void AddressFamilyIsAValidCrossFamilyVerifierDiscriminator()
+    {
+        var expected = Row();
+        var observed = RowV6();
+        Assert.NotEqual(expected.Key.AddressFamily, observed.Key.AddressFamily);
+        Assert.Equal(ExactRouteVerificationStatus.NoMatch,
+            ExactRouteVerifier.VerifyPresent(Complete(observed), expected).Status);
     }
 
     [Theory]
     [InlineData("metric")]
     [InlineData("index")]
-    [InlineData("protocol")]
     [InlineData("sitePrefix")]
     [InlineData("validLifetime")]
     [InlineData("preferredLifetime")]
@@ -180,18 +216,15 @@ public sealed class ExactRouteReadbackTests
         var expected = Row();
         var actual = field switch
         {
-            "metric" => expected with { Metric = expected.Metric + 1 },
+            "metric" => WithProfile(expected, ProfileFor(expected, metric: expected.Metric + 1)),
             "index" => expected with { InterfaceIndex = expected.InterfaceIndex + 1 },
-            "protocol" => expected with { Protocol = expected.Protocol + 1 },
-            "sitePrefix" => expected with { SitePrefixLength = (byte)(expected.SitePrefixLength - 1) },
-            "validLifetime" => expected with { ValidLifetime = 101, PreferredLifetime = 100 },
-            _ => expected with { ValidLifetime = 102, PreferredLifetime = 101 }
+            "sitePrefix" => WithProfile(expected, ProfileFor(expected, sitePrefix: (byte)(expected.SitePrefixLength - 1))),
+            "validLifetime" => WithProfile(expected, ProfileFor(expected, valid: 101, preferred: 100)),
+            _ => WithProfile(expected, ProfileFor(expected, valid: 102, preferred: 101))
         };
+        var expectedProfile = ProfileFor(expected, valid: 100, preferred: 100);
         Assert.Equal(ExactRouteVerificationStatus.ExpectedProfileMismatch,
-            ExactRouteVerifier.VerifyPresent(Complete(actual), expected.Key, Profile(expected) with
-            {
-                ValidLifetime = new(100), PreferredLifetime = new(100)
-            }).Status);
+            ExactRouteVerifier.VerifyPresent(Complete(actual), WithProfile(expected, expectedProfile)).Status);
     }
 
     [Theory]
@@ -204,13 +237,13 @@ public sealed class ExactRouteReadbackTests
         var expected = Row();
         var actual = field switch
         {
-            "loopback" => expected with { Loopback = !expected.Loopback },
-            "autoconfigure" => expected with { AutoconfigureAddress = !expected.AutoconfigureAddress },
-            "publish" => expected with { Publish = !expected.Publish },
-            _ => expected with { Immortal = !expected.Immortal }
+            "loopback" => WithProfile(expected, ProfileFor(expected, loopback: !expected.Loopback)),
+            "autoconfigure" => WithProfile(expected, ProfileFor(expected, autoconfigure: !expected.AutoconfigureAddress)),
+            "publish" => WithProfile(expected, ProfileFor(expected, publish: !expected.Publish)),
+            _ => WithProfile(expected, ProfileFor(expected, immortal: !expected.Immortal))
         };
         Assert.Equal(ExactRouteVerificationStatus.ExpectedProfileMismatch,
-            ExactRouteVerifier.VerifyPresent(Complete(actual), expected.Key, Profile(expected)).Status);
+            ExactRouteVerifier.VerifyPresent(Complete(actual), expected).Status);
     }
 
     [Fact]
@@ -219,41 +252,29 @@ public sealed class ExactRouteReadbackTests
         var expected = Row();
         var actual = expected with { Origin = 999, Age = 123456 };
         Assert.Equal(ExactRouteVerificationStatus.VerifiedPresent,
-            ExactRouteVerifier.VerifyPresent(Complete(actual), expected.Key, Profile(expected)).Status);
+            ExactRouteVerifier.VerifyPresent(Complete(actual), expected).Status);
+    }
+
+    [Fact]
+    public void InterfaceIndexAgeAndOriginRemainOutsideSemanticIdentity()
+    {
+        var row = Row();
+        var changedObservation = row with { InterfaceIndex = 99, Age = 500, Origin = 700 };
+        Assert.Same(row.Identity, changedObservation.Identity);
+        Assert.Equal(row.Identity, changedObservation.Identity);
+        Assert.DoesNotContain(typeof(ExactRouteMutationIdentity).GetProperties(),
+            property => property.Name is nameof(ExactNativeRouteRow.InterfaceIndex) or nameof(ExactNativeRouteRow.Age) or nameof(ExactNativeRouteRow.Origin));
     }
 
     [Fact]
     public void FiniteLifetimesMayCountDownButNotIncrease()
     {
-        var expected = Row() with { ValidLifetime = 100, PreferredLifetime = 80 };
-        var actual = expected with { ValidLifetime = 90, PreferredLifetime = 70 };
+        var expected = WithProfile(Row(), ProfileFor(Row(), valid: 100, preferred: 80));
+        var actual = WithProfile(expected, ProfileFor(expected, valid: 90, preferred: 70));
         Assert.Equal(ExactRouteVerificationStatus.VerifiedPresent,
-            ExactRouteVerifier.VerifyPresent(Complete(actual), expected.Key, Profile(expected)).Status);
+            ExactRouteVerifier.VerifyPresent(Complete(actual), expected).Status);
         Assert.Equal(ExactRouteVerificationStatus.ExpectedProfileMismatch,
-            ExactRouteVerifier.VerifyPresent(Complete(actual with { ValidLifetime = 101 }), expected.Key, Profile(expected)).Status);
-    }
-
-    [Theory]
-    [InlineData("luid")]
-    [InlineData("nextHop")]
-    [InlineData("scope")]
-    [InlineData("destination")]
-    [InlineData("prefix")]
-    public void NativeKeyChangesNeverVerify(string field)
-    {
-        var expected = Row();
-        var changedKey = field switch
-        {
-            "luid" => expected.Key with { InterfaceLuid = 99 },
-            "nextHop" => expected.Key with { NextHopAddress = "192.0.2.254" },
-            "scope" => KeyV6() with { NextHopScopeId = 8 },
-            "destination" => expected.Key with { DestinationAddress = "192.0.2.2" },
-            _ => expected.Key with { DestinationPrefixLength = 31 }
-        };
-        var actual = field == "scope" ? RowV6() with { Key = changedKey } : expected with { Key = changedKey };
-        var expectedRow = field == "scope" ? RowV6() : expected;
-        Assert.NotEqual(ExactRouteVerificationStatus.VerifiedPresent,
-            ExactRouteVerifier.VerifyPresent(Complete(actual), expectedRow.Key, Profile(expectedRow)).Status);
+            ExactRouteVerifier.VerifyPresent(Complete(WithProfile(actual, ProfileFor(actual, valid: 101))), expected).Status);
     }
 
     [Fact]
@@ -264,61 +285,13 @@ public sealed class ExactRouteReadbackTests
         var oversized = new ExactRouteObservation(Enumerable.Repeat(expected, WindowsExactRouteReader.MaximumRoutes).ToArray(),
             true, true, true, ["Native row count exceeds 4096."]);
         Assert.Equal(ExactRouteVerificationStatus.IncompleteObservation,
-            ExactRouteVerifier.VerifyPresent(readFailure, expected.Key, Profile(expected)).Status);
+            ExactRouteVerifier.VerifyPresent(readFailure, expected).Status);
         Assert.Equal(ExactRouteVerificationStatus.IncompleteObservation,
-            ExactRouteVerifier.VerifyPresent(oversized, expected.Key, Profile(expected)).Status);
+            ExactRouteVerifier.VerifyPresent(oversized, expected).Status);
         var count = WindowsExactRouteReader.AssessNativeCount(4097, WindowsExactRouteReader.MaximumRoutes);
         Assert.False(count.CanMaterialize);
         Assert.True(count.Truncated);
         Assert.Equal(0, count.RowsToRead);
-    }
-
-    [Fact]
-    public void MalformedSemanticEvidenceCannotBypassDecoderValidation()
-    {
-        var expected = Row();
-        var malformedFamily = expected with { Key = expected.Key with { AddressFamily = (NativeRouteAddressFamily)99 } };
-        var malformedPrefix = expected with { Key = expected.Key with { DestinationPrefixLength = 33 } };
-        Assert.Equal(ExactRouteVerificationStatus.IncompleteObservation,
-            ExactRouteVerifier.VerifyPresent(Complete(malformedFamily), expected.Key, Profile(expected)).Status);
-        Assert.Equal(ExactRouteVerificationStatus.IncompleteObservation,
-            ExactRouteVerifier.VerifyPresent(Complete(malformedPrefix), expected.Key, Profile(expected)).Status);
-    }
-
-    [Theory]
-    [InlineData(-1)]
-    [InlineData(long.MinValue)]
-    [InlineData(long.MaxValue)]
-    public void MalformedIpv6ExpectedAndObservedScopesCannotVerify(long scope)
-    {
-        var expected = RowV6();
-        var malformedKey = expected.Key with { NextHopScopeId = scope };
-        var malformedObserved = expected with { Key = malformedKey };
-        Assert.Equal(ExactRouteVerificationStatus.IncompleteObservation,
-            ExactRouteVerifier.VerifyPresent(Complete(expected), malformedKey, Profile(expected)).Status);
-        Assert.Equal(ExactRouteVerificationStatus.IncompleteObservation,
-            ExactRouteVerifier.VerifyPresent(Complete(malformedObserved), expected.Key, Profile(expected)).Status);
-    }
-
-    [Fact]
-    public void Ipv6MaximumScopeIsValidAndNextValueIsRejected()
-    {
-        var expected = RowV6();
-        var maximum = expected with { Key = expected.Key with { NextHopScopeId = uint.MaxValue } };
-        Assert.Equal(ExactRouteVerificationStatus.VerifiedPresent,
-            ExactRouteVerifier.VerifyPresent(Complete(maximum), maximum.Key, Profile(maximum)).Status);
-        var tooLarge = maximum.Key with { NextHopScopeId = (long)uint.MaxValue + 1 };
-        Assert.Equal(ExactRouteVerificationStatus.IncompleteObservation,
-            ExactRouteVerifier.VerifyPresent(Complete(maximum), tooLarge, Profile(maximum)).Status);
-    }
-
-    [Fact]
-    public void Ipv4NonzeroScopeCannotVerify()
-    {
-        var expected = Row();
-        var malformed = expected.Key with { NextHopScopeId = 1 };
-        Assert.Equal(ExactRouteVerificationStatus.IncompleteObservation,
-            ExactRouteVerifier.VerifyPresent(Complete(expected), malformed, Profile(expected)).Status);
     }
 
     [Theory]
@@ -330,10 +303,14 @@ public sealed class ExactRouteReadbackTests
     [InlineData(0U, 0U, true)]
     public void ExpectedLifetimeProfileRelationshipIsValidated(uint valid, uint preferred, bool accepted)
     {
-        var expected = Row() with { ValidLifetime = valid, PreferredLifetime = preferred };
-        var profile = Profile(expected);
-        var actual = expected;
-        var status = ExactRouteVerifier.VerifyPresent(Complete(actual), expected.Key, profile).Status;
+        var baseRow = Row();
+        ExactRouteVerificationStatus status;
+        try
+        {
+            var expected = WithProfile(baseRow, ProfileFor(baseRow, valid: valid, preferred: preferred));
+            status = ExactRouteVerifier.VerifyPresent(Complete(expected), expected).Status;
+        }
+        catch (ArgumentOutOfRangeException) { status = ExactRouteVerificationStatus.IncompleteObservation; }
         Assert.Equal(accepted ? ExactRouteVerificationStatus.VerifiedPresent : ExactRouteVerificationStatus.IncompleteObservation, status);
     }
 
@@ -345,7 +322,8 @@ public sealed class ExactRouteReadbackTests
             ExactRouteVerifier.VerifyAbsent(Complete(), expected.Key).Status);
         Assert.NotEqual(ExactRouteVerificationStatus.VerifiedAbsent,
             ExactRouteVerifier.VerifyAbsent(Complete(expected), expected.Key).Status);
-        var collision = expected with { Key = expected.Key with { InterfaceLuid = 999 } };
+        var collision = WithKey(expected, NativeRouteKey.Create(NativeRouteAddressFamily.IPv4,
+            IPAddress.Parse("192.0.2.1"), 32, IPAddress.Any, 999));
         Assert.Equal(ExactRouteVerificationStatus.ReducedIdentityCollision,
             ExactRouteVerifier.VerifyAbsent(Complete(collision), expected.Key).Status);
     }
@@ -404,18 +382,44 @@ public sealed class ExactRouteReadbackTests
 
     private static ExactRouteObservation Complete(params ExactNativeRouteRow[] rows) => new(rows, true, true, false, []);
 
-    private static ExactNativeRouteRow Row(string destination = "192.0.2.1") => new(
-        NativeRouteKey.Create(NativeRouteAddressFamily.IPv4, IPAddress.Parse(destination), 32, IPAddress.Any, 42),
-        7, 32, uint.MaxValue, uint.MaxValue, 5, 3, false, false, false, true, 1, 2);
+    private static ExactNativeRouteRow Row(string destination = "192.0.2.1")
+    {
+        var key = NativeRouteKey.Create(NativeRouteAddressFamily.IPv4, IPAddress.Parse(destination), 32, IPAddress.Any, 42);
+        var profile = new NativeRouteProfile(32, uint.MaxValue, uint.MaxValue, 5, 3, false, false, false, true);
+        return new(new ExactRouteMutationIdentity(1, key, profile), 7, 1, 2);
+    }
 
-    private static NativeRouteKey KeyV6() => NativeRouteKey.Create(NativeRouteAddressFamily.IPv6,
-        IPAddress.Parse("2001:db8::1"), 128, new IPAddress(IPAddress.Parse("fe80::1").GetAddressBytes(), 7), 42);
+    private static NativeRouteKey KeyV6() => KeyV6("2001:db8::1", 128, "fe80::1", 7, 42);
 
-    private static ExactNativeRouteRow RowV6() => Row() with { Key = KeyV6(), SitePrefixLength = 128 };
+    private static NativeRouteKey KeyV6(string destination, byte prefix, string nextHop, uint scope, ulong luid) =>
+        NativeRouteKey.Create(NativeRouteAddressFamily.IPv6, IPAddress.Parse(destination), prefix,
+            new IPAddress(IPAddress.Parse(nextHop).GetAddressBytes(), scope), luid);
 
-    private static NativeRouteExpectedProfile Profile(ExactNativeRouteRow row) => new(row.InterfaceIndex,
-        row.SitePrefixLength, new(row.ValidLifetime), new(row.PreferredLifetime), row.Metric, row.Protocol,
-        row.Loopback, row.AutoconfigureAddress, row.Publish, row.Immortal);
+    private static ExactNativeRouteRow RowV6()
+    {
+        var row = Row();
+        return new(new ExactRouteMutationIdentity(1, KeyV6(), ProfileFor(row, sitePrefix: 128)), row.InterfaceIndex, row.Age, row.Origin);
+    }
+
+    private static ExactNativeRouteRow RowV6(string destination, byte prefix, string nextHop, uint scope, ulong luid)
+    {
+        var row = Row();
+        return new(new ExactRouteMutationIdentity(1, KeyV6(destination, prefix, nextHop, scope, luid),
+            ProfileFor(row, sitePrefix: 128)), row.InterfaceIndex, row.Age, row.Origin);
+    }
+
+    private static ExactNativeRouteRow WithKey(ExactNativeRouteRow row, NativeRouteKey key) =>
+        new(new ExactRouteMutationIdentity(1, key, row.Profile), row.InterfaceIndex, row.Age, row.Origin);
+
+    private static ExactNativeRouteRow WithProfile(ExactNativeRouteRow row, NativeRouteProfile profile) =>
+        new(new ExactRouteMutationIdentity(1, row.Key, profile), row.InterfaceIndex, row.Age, row.Origin);
+
+    private static NativeRouteProfile ProfileFor(ExactNativeRouteRow row, byte? sitePrefix = null,
+        uint? valid = null, uint? preferred = null, uint? metric = null, bool? loopback = null,
+        bool? autoconfigure = null, bool? publish = null, bool? immortal = null) => new(sitePrefix ?? row.SitePrefixLength,
+        valid ?? row.ValidLifetime, preferred ?? row.PreferredLifetime, metric ?? row.Metric, row.Protocol,
+        loopback ?? row.Loopback, autoconfigure ?? row.AutoconfigureAddress,
+        publish ?? row.Publish, immortal ?? row.Immortal);
 
     private static ExactNativeMibIpForwardRow2 NativeRow(
         string destination, byte prefix, string nextHop, uint scope = 0)

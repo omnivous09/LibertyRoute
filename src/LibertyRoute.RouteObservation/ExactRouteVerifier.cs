@@ -1,3 +1,5 @@
+using LibertyRoute.Core;
+
 namespace LibertyRoute.RouteObservation;
 
 public enum ExactRouteVerificationStatus
@@ -21,19 +23,19 @@ public static class ExactRouteVerifier
         string Reason);
 
     public static Verification VerifyPresent(
-        ExactRouteObservation observation, NativeRouteKey expectedKey, NativeRouteExpectedProfile expectedProfile)
+        ExactRouteObservation observation, ExactNativeRouteRow expected)
     {
         ArgumentNullException.ThrowIfNull(observation);
-        ArgumentNullException.ThrowIfNull(expectedKey);
-        ArgumentNullException.ThrowIfNull(expectedProfile);
+        ArgumentNullException.ThrowIfNull(expected);
         if (!observation.Complete) return Incomplete(observation);
-        if (!NativeRouteEvidenceValidator.IsValidKey(expectedKey) || !expectedProfile.IsValidFor(expectedKey))
-            return Malformed("Expected route key or normalized profile is malformed.");
+        if (!NativeRouteEvidenceValidator.IsValid(expected))
+            return Malformed("Expected interface-index corroboration is malformed.");
         if (observation.Rows.Any(row => !NativeRouteEvidenceValidator.IsValid(row)))
             return Malformed("Native route observation contains malformed semantic evidence.");
 
-        var full = observation.Rows.Where(row => row.Key == expectedKey).ToArray();
-        var reduced = observation.Rows.Where(expectedKey.HasSameReducedIdentity).ToArray();
+        var expectedKey = expected.Key;
+        var full = observation.Rows.Where(row => row.Key.Equals(expectedKey)).ToArray();
+        var reduced = observation.Rows.Where(row => expectedKey.HasSameReducedIdentity(row.Key)).ToArray();
         if (full.Length > 1)
             return Result(ExactRouteVerificationStatus.DuplicateFullKeyMatches, full, reduced, "More than one full native-key row was observed.");
         if (full.Length == 0)
@@ -42,7 +44,7 @@ public static class ExactRouteVerifier
                 : Result(ExactRouteVerificationStatus.ReducedIdentityCollision, full, reduced, "A conflicting row shares the destination identity.");
         if (reduced.Length != 1)
             return Result(ExactRouteVerificationStatus.ReducedIdentityCollision, full, reduced, "The full-key row is ambiguous under the reduced destination identity.");
-        if (!expectedProfile.Matches(full[0]))
+        if (full[0].InterfaceIndex != expected.InterfaceIndex || !expected.Profile.IsSatisfiedBy(full[0].Profile))
             return Result(ExactRouteVerificationStatus.ExpectedProfileMismatch, full, reduced, "The native row does not satisfy the expected normalized profile.");
         return Result(ExactRouteVerificationStatus.VerifiedPresent, full, reduced, "Exactly one acceptable native row was observed.");
     }
@@ -52,13 +54,11 @@ public static class ExactRouteVerifier
         ArgumentNullException.ThrowIfNull(observation);
         ArgumentNullException.ThrowIfNull(expectedKey);
         if (!observation.Complete) return Incomplete(observation);
-        if (!NativeRouteEvidenceValidator.IsValidKey(expectedKey))
-            return Malformed("Expected route key is malformed.");
         if (observation.Rows.Any(row => !NativeRouteEvidenceValidator.IsValid(row)))
             return Malformed("Native route observation contains malformed semantic evidence.");
 
-        var full = observation.Rows.Where(row => row.Key == expectedKey).ToArray();
-        var reduced = observation.Rows.Where(expectedKey.HasSameReducedIdentity).ToArray();
+        var full = observation.Rows.Where(row => row.Key.Equals(expectedKey)).ToArray();
+        var reduced = observation.Rows.Where(row => expectedKey.HasSameReducedIdentity(row.Key)).ToArray();
         if (full.Length != 0)
             return Result(full.Length > 1 ? ExactRouteVerificationStatus.DuplicateFullKeyMatches : ExactRouteVerificationStatus.ExpectedProfileMismatch,
                 full, reduced, "The owned native route key is still present.");

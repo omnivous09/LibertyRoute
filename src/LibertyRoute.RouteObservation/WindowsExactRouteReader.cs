@@ -1,5 +1,6 @@
 using System.Net;
 using System.Runtime.InteropServices;
+using LibertyRoute.Core;
 
 namespace LibertyRoute.RouteObservation;
 
@@ -84,10 +85,11 @@ public static class NativeRouteDecoder
 
         var key = NativeRouteKey.Create(expectedFamily, destination, row.DestinationPrefix.PrefixLength,
             nextHop, row.InterfaceLuid);
-        return new ExactNativeRouteRow(key, row.InterfaceIndex, row.SitePrefixLength,
-            row.ValidLifetime, row.PreferredLifetime, row.Metric, row.Protocol,
-            ToBoolean(row.Loopback), ToBoolean(row.AutoconfigureAddress), ToBoolean(row.Publish),
-            ToBoolean(row.Immortal), row.Age, row.Origin);
+        var profile = new NativeRouteProfile(row.SitePrefixLength, row.ValidLifetime,
+            row.PreferredLifetime, row.Metric, row.Protocol, ToBoolean(row.Loopback),
+            ToBoolean(row.AutoconfigureAddress), ToBoolean(row.Publish), ToBoolean(row.Immortal));
+        return new ExactNativeRouteRow(new ExactRouteMutationIdentity(
+            ExactRouteMutationIdentity.CurrentSchemaVersion, key, profile), row.InterfaceIndex, row.Age, row.Origin);
     }
 
     private static IPAddress DecodeAddress(

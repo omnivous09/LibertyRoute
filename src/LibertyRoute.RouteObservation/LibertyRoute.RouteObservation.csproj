@@ -7,4 +7,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="LibertyRoute.RouteObservation.Tool" />
   </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LibertyRoute.Core\LibertyRoute.Core.csproj" />
+  </ItemGroup>
 </Project>
